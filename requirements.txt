@@ -1,0 +1,14 @@
+# 日本麻雀 AI 牌局分析助手 — Python 依賴
+# 安裝：pip install -r requirements.txt
+
+streamlit>=1.61.1
+pillow>=10.0.0
+openai>=1.40.0
+
+# 本機手牌辨識（模板比對）
+opencv-python>=4.8.0
+numpy>=1.25.0
+
+# 註：Ollama 本機視覺模型唔使裝 Python 套件，
+# 只需另外安裝 Ollama 並執行 `ollama pull qwen2.5vl:7b`。
+# 本程式用 requests 呼叫 http://localhost:11434，requests 已隨 streamlit 安裝。

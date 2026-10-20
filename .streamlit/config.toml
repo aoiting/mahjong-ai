@@ -1,0 +1,20 @@
+# Streamlit 設定檔
+# 放在專案目錄下的 .streamlit/config.toml，執行 `streamlit run app.py` 時會自動套用。
+
+[server]
+# 綁定 IPv4（0.0.0.0 = 接受來自 localhost 與區域網路的連線）
+# 預設綁定 IPv6 "::"，在網路介面變動（例如切換 VPN）時容易發生 WinError 64 而失去監聽
+address = "0.0.0.0"
+port = 8501
+# 不在終端機顯示 email 訂閱提示
+headless = true
+
+[browser]
+# 關閉匿名使用統計
+gatherUsageStats = false
+
+# 注意：若要從其他裝置（手機／平板）連線，請改用本機區域網路 IP，
+# 例如 http://192.168.50.204:8501。若出現 CORS 相關錯誤，
+# 再視需要加上：
+#   enableCORS = false
+#   enableXsrfProtection = false
