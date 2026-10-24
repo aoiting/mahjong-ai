@@ -3,7 +3,12 @@
 
 streamlit>=1.61.1
 pillow>=10.0.0
-openai>=1.40.0
+
+# 呼叫 OpenRouter（雲端）／本機 Ollama 都用 requests
+requests>=2.31.0
+
+# 確定性麻雀計算（向聽／進張／役種／點數）
+mahjong>=2.0.0
 
 # 本機手牌辨識（模板比對）
 opencv-python>=4.8.0
