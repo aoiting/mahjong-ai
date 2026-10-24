@@ -7,11 +7,12 @@ from PIL import Image
 
 import ai_client as ai
 import mahjong_engine as me
+import tile_images as ti
 import tile_recognizer as tr
 
 # OpenRouter 模型（實測後嘅建議）
 # 註：minimax-m3.1-flash:free 免費期已於 2026-10-22 結束；Gemini 喺香港被地區封鎖。
-DEFAULT_VISION_MODEL = "meta/muse-glimmer-30b"
+DEFAULT_VISION_MODEL = "meta/muse-spark-1.3-contributor"
 DEFAULT_ANALYSIS_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
@@ -180,8 +181,9 @@ with st.sidebar:
                 value=get_secret("OPENROUTER_ANALYSIS_MODEL", default=DEFAULT_ANALYSIS_MODEL),
             )
             st.caption(
-                "免費模型：辨識用 `minimax/minimax-m3.1-flash:free`（快、準）；"
-                "分析用 `nvidia/nemotron-3-ultra-550b-a55b:free`（慢約 1–2 分鐘，但質素較好）。"
+                "預設辨識用 `meta/muse-spark-1.3-contributor`（準、有視覺），"
+                "被封鎖時會自動轉用 `meta/muse-spark-open`。"
+                "分析用 `nvidia/nemotron-3-ultra-550b-a55b:free`（約 1–2 分鐘）。"
             )
 
         if st.button("🔌 測試連線", width="stretch"):
@@ -440,9 +442,12 @@ for source, value in (
 st.divider()
 if effective_hand:
     st.markdown(
-        f"**目前手牌**（來自{hand_source}）：`{effective_hand}`　—　"
+        f"**目前手牌**（來自{hand_source}）　·　"
         f"{tr.count_tiles(effective_hand)} 張"
     )
+    ti.render_hand(effective_hand, height=54)
+    with st.expander("顯示牌局代碼（複製／除錯用）"):
+        st.code(effective_hand, language=None)
 else:
     st.warning("尚未取得手牌，請在上面任何一個頁籤輸入或辨識。")
 
@@ -455,33 +460,47 @@ if effective_hand:
     if calc.get("error"):
         st.warning(calc["error"])
     else:
-        st.success(calc.get("summary", ""))
+        st.markdown(
+            '<div style="background:#e9f7ef;border:1px solid #b7e2c6;'
+            'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+            + ti.decorate_text(calc.get("summary", ""), height=28)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
         if calc.get("discards"):
-            import pandas as pd
-
             rows = [
                 {
-                    "切牌": d["tile"],
-                    "向聽": d["shanten"],
-                    "有效牌數": d["ukeire_count"],
-                    "有效牌": "、".join(f"{t}({c})" for t, c in d["ukeire"]) or "—",
+                    "tile": d["tile"],
+                    "shanten": d["shanten"],
+                    "ukeire_count": d["ukeire_count"],
+                    "ukeire": d["ukeire"],
                 }
                 for d in calc["discards"][:6]
             ]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.markdown(ti.discard_table_html(rows), unsafe_allow_html=True)
 
         if calc.get("waits"):
-            st.markdown(
-                "**待牌**：" + "、".join(f"`{t}`（剩 {c} 張）" for t, c in calc["waits"])
-            )
+            st.markdown("**待牌**")
+            st.markdown(ti.waits_html(calc["waits"]), unsafe_allow_html=True)
+            with st.expander("顯示待牌代碼"):
+                st.code(
+                    " ".join(t for t, _ in calc["waits"]), language=None
+                )
 
         if calc.get("agari_preview"):
             st.markdown("**和牌預覽**（榮和、門清）：")
             for v in calc["agari_preview"]:
                 yaku = "、".join(v["yaku"]) or "無役"
                 cost = (v.get("cost") or {}).get("main", 0)
-                st.markdown(f"- 待 `{v['wait']}`：{yaku}　{v['han']} 翻 {v['fu']} 符　{cost} 點")
+                st.markdown(
+                    f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;'
+                    f'margin:4px 0;">'
+                    f'<span style="color:#666;font-size:0.9rem;">待</span>'
+                    f'{ti.inline_html(v["wait"], 30)}'
+                    f'<span>{yaku}　{v["han"]} 翻 {v["fu"]} 符　{cost} 點</span></div>',
+                    unsafe_allow_html=True,
+                )
 
         if calc.get("agari"):
             for kind, v in calc["agari"].items():
@@ -539,8 +558,11 @@ if result:
         st.success(result["msg"])
         st.subheader("📊 分析結果")
         with st.container(border=True):
-            st.markdown(result["text"])
-        st.caption(f"手牌：`{result['hand']}`　·　{result['msg']}")
+            st.markdown(
+                ti.decorate_text(result["text"], height=26),
+                unsafe_allow_html=True,
+            )
+        st.caption(result["msg"])
         st.warning(
             "⚠️ AI 分析僅供參考，可能有錯（例如誤判役種、向聽數）。重要決定請自行核對。"
         )

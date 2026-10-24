@@ -22,7 +22,7 @@ from PIL import Image
 import tile_recognizer as tr
 
 BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "meta/muse-glimmer-30b")
+DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "meta/muse-spark-1.3-contributor")
 
 # 免費模型係 reasoning 模型，思考會用掉 token，
 # 所以 max_tokens 唔可以設得太細，否則 content 會係空。
@@ -34,9 +34,9 @@ ANALYSIS_MAX_TOKENS = 6000
 # 視覺辨識備援模型（按實測可靠度排序；第一個掛咗就試下一個）
 # 註：minimax-m3.1-flash:free 嘅免費期已於 2026-10-22 結束，唔可以再用。
 VISION_FALLBACK_MODELS = [
-    "meta/muse-glimmer-30b",
-    "nvidia/nemotron-3.5-super-vl:free",
+    "meta/muse-spark-1.3-contributor",
     "meta/muse-spark-open",
+    "meta/muse-glimmer-30b",
 ]
 
 # 分析備援模型（免費、有正式文字輸出）
@@ -112,6 +112,12 @@ def _friendly_error(status: int | None, detail: str = "") -> str:
             "OpenRouter 額度不足：你帳戶餘額係 $0，可負擔嘅請求大小會隨用量越縮越細，"
             "最後連細請求都會俾人擋。請去 openrouter.ai/settings/credits 入錢"
             "（最低 US$5 就足夠用很久）。"
+        )
+    if "guardrail" in d or "training violation" in d:
+        return (
+            "呢個模型嘅供應商要求「允許用付費請求做訓練」，但你 OpenRouter 帳戶嘅"
+            "私隱設定封鎖咗。請去 openrouter.ai/settings/privacy 開啟相關選項，"
+            "或者改用其他視覺模型。"
         )
     mapping = {
         400: "請求格式有誤（模型唔支援某個參數）。",
@@ -400,6 +406,27 @@ def _read_man_numeral(tile: Image.Image, api_key: str, model: str) -> int | None
     return int(m.group(1)) if m else None
 
 
+def _model_unusable(msg: str) -> bool:
+    """判斷錯誤係咪「呢個模型完全用唔到」（而唔係一次過嘅 502）。
+
+    呢類錯誤重試 3 次都只係浪費時間，所以直接跳去下一個備援模型。
+    """
+    t = (msg or "").lower()
+    return any(
+        k in t
+        for k in (
+            "guardrail",
+            "training violation",
+            "0 endpoints",
+            "私隱設定封鎖",
+            "搵唔到模型",
+            "無供應商",
+            "api key 無效",
+            "餘額不足",
+        )
+    )
+
+
 def recognize_hand_per_tile(
     image: Image.Image,
     api_key: str,
@@ -426,6 +453,7 @@ def recognize_hand_per_tile(
 
     tiles: list[str | None] = []
     errors: list[str] = []
+    dead: set[str] = set()
     total = len(boxes)
 
     # 免費模型有嚴格速率限制（免費層約 20 次/分鐘），所以要節流；
@@ -462,14 +490,23 @@ def recognize_hand_per_tile(
         hint = local_hint(profile, hint_text)
         code = None
         last = ""
-        # 主模型試 3 次（上游常有暫時性 502），失敗先換備援模型試 1 次
-        attempts = [(models[0], 3)] if len(models) == 1 else [(models[0], 3), (models[1], 1)]
+        used_model = ""
+        # 主模型試 3 次（上游常有暫時性 502），失敗先逐個備援模型試 1 次。
+        # 如果某模型係「完全用唔到」（例如被 guardrail 封鎖），即刻標記為 dead，
+        # 後面嘅牌就唔會再浪費時間重試。
+        attempts = [(models[0], 3)] + [(m, 1) for m in models[1:]]
         for m, tries in attempts:
+            if m in dead:
+                continue
             for attempt in range(tries):
                 code, msg = recognize_tile(crop, api_key, m, hint=hint)
                 if code:
+                    used_model = m
                     break
                 last = msg
+                if _model_unusable(msg):
+                    dead.add(m)
+                    break
                 time.sleep(1.5 * (attempt + 1))  # 退避重試
             if code:
                 break
@@ -477,7 +514,7 @@ def recognize_hand_per_tile(
         # 萬子嘅漢數字最易讀錯 → 單獨放大上半部分再讀一次
         if code and code.endswith("m"):
             time.sleep(min(delay, 1.5))
-            n = _read_man_numeral(crop, api_key, models[0])
+            n = _read_man_numeral(crop, api_key, used_model or models[0])
             if n:
                 code = f"{n}m"
 
