@@ -2,7 +2,7 @@
 
 唔會改動精算引擎（mahjong_engine）任何向聽／和牌計算，
 只根據手牌統計提供：
-  1. direction_hints：潛在役種方向（三元牌、混一色、七對子）
+  1. direction_hints：潛在役種方向（三元牌、混一色、七對子、斷么九）
   2. confirmed_yaku：已經成刻子嘅役牌（白發中、場風、自風）
 """
 
@@ -14,6 +14,15 @@ HONOR_NAMES = {"1z": "東", "2z": "南", "3z": "西", "4z": "北", "5z": "白", 
 DRAGONS = {"5z": "白", "6z": "發", "7z": "中"}
 WIND_Z = {"東": "1z", "南": "2z", "西": "3z", "北": "4z"}
 SUIT_NAMES = {"m": "萬子", "p": "筒子", "s": "索子"}
+SUIT_SHORT = {"m": "萬", "p": "筒", "s": "索"}
+NUMBER_NAMES = {"1": "一", "9": "九"}
+
+
+def _terminal_honor_name(tile: str) -> str:
+    """邊張／字牌嘅中文名，例如 9s → 九索、1z → 東、5z → 白。"""
+    if tile.endswith("z"):
+        return HONOR_NAMES.get(tile, tile)
+    return f"{NUMBER_NAMES.get(tile[0], tile[0])}{SUIT_SHORT.get(tile[-1], tile[-1])}"
 
 
 def tile_counts(hand: str, meld_tiles: list[str] | None = None) -> dict[str, int]:
@@ -78,6 +87,23 @@ def direction_hints(
     pairs = sum(1 for c in counts.values() if c >= 2)
     if int(meld_count) == 0 and not meld_tiles and pairs >= 4:
         hints.append(f"對子 {pairs} 個，七對子路線可考慮")
+
+    # ── 斷么九：只計邊張（一／九）同字牌（風牌＋三元牌）──
+    terminal_honors = [
+        (tile, count)
+        for tile, count in counts.items()
+        if tile.endswith("z") or tile[0] in "19"
+    ]
+    terminal_honor_total = sum(count for _, count in terminal_honors)
+    if terminal_honor_total == 0:
+        hints.append("斷么九：全手都係二至八，冇邊張字牌，點和都有斷么九")
+    elif terminal_honor_total == 1:
+        tile = next(tile for tile, count in terminal_honors if count)
+        name = _terminal_honor_name(tile)
+        hints.append(
+            f"斷么九：淨返一隻 {name} 係邊張／字牌，"
+            "切咗佢就全手二至八，入斷么九路線"
+        )
 
     return "；".join(hints) if hints else "無明顯役種方向"
 
