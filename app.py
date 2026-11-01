@@ -799,35 +799,7 @@ if "hand_tiles" not in st.session_state:
 with st.container(key="input_card", border=True):
     st.markdown("### ① 入手牌")
 
-    tab_camera, tab_upload, tab_manual = st.tabs(["📸 影相", "🖼️ 上傳圖片", "⌨️ 手入"])
-
-    with tab_camera:
-        camera_image = st.camera_input("對準手牌影相", key="camera_input")
-        if camera_image is not None:
-            st.image(camera_image, caption="擷取畫面", width="stretch")
-            data = camera_image.getvalue()
-            sig = hashlib.md5(data).hexdigest()
-            if st.session_state.get("camera_sig") != sig:
-                st.session_state["camera_sig"] = sig
-                rec_status: dict = {}
-                with st.spinner("即時辨識中..."):
-                    hand, msg = cached_recognize(
-                        data, engine, provider, api_key, vision_model,
-                        force=True, per_tile=per_tile, local_first=local_first,
-                        status=rec_status,
-                    )
-                if hand:
-                    set_hand(
-                        ti.expand_hand(hand), "即時影相",
-                        recognized=True, drawn=rec_status.get("drawn"),
-                        meld_tiles=rec_status.get("meld_tiles") or [],
-                    )
-                    st.session_state["recognize_msg"] = msg
-                    st.rerun()
-                st.session_state["recognize_msg"] = msg
-            if st.button("🔄 重新辨識", key="btn_camera_retry"):
-                st.session_state.pop("camera_sig", None)
-                st.rerun()
+    tab_upload, tab_manual = st.tabs(["🖼️ 上傳圖片", "⌨️ 手入"])
 
     with tab_upload:
         uploaded_image = st.file_uploader(
@@ -836,10 +808,18 @@ with st.container(key="input_card", border=True):
             accept_multiple_files=False,
             label_visibility="visible",
         )
+        camera_open = st.toggle("📷 用相機影", key="camera_open")
+        camera_image = (
+            st.camera_input("對準手牌影相", key="camera_input")
+            if camera_open else None
+        )
         st.caption("💡 截圖辨識率最高；實體相片若因光線／角度認錯，可於下方逐隻修改。")
 
-        if uploaded_image is not None:
-            st.image(uploaded_image, caption="已上傳的圖片", width="stretch")
+        source_image = uploaded_image if uploaded_image is not None else camera_image
+        if source_image is not None:
+            source_label = "圖片上傳" if uploaded_image is not None else "相機拍攝"
+            image_caption = "已上傳的圖片" if uploaded_image is not None else "相機拍攝"
+            st.image(source_image, caption=image_caption, width="stretch")
             with st.expander("🔍 裁剪設定", expanded=False):
                 bottom_pct = st.slider(
                     "只分析畫面底部百分比", 15, 100, 100, 5,
@@ -853,7 +833,7 @@ with st.container(key="input_card", border=True):
                 rec_status: dict = {}
                 with st.spinner("辨識中..."):
                     hand, msg = cached_recognize(
-                        uploaded_image.getvalue(), engine, provider, api_key,
+                        source_image.getvalue(), engine, provider, api_key,
                         vision_model, force=do_force, bottom_pct=bottom_pct,
                         per_tile=per_tile, local_first=local_first,
                         status=rec_status,
@@ -861,7 +841,7 @@ with st.container(key="input_card", border=True):
                 st.session_state["recognize_msg"] = msg
                 if hand:
                     set_hand(
-                        ti.expand_hand(hand), "圖片上傳",
+                        ti.expand_hand(hand), source_label,
                         recognized=True, drawn=rec_status.get("drawn"),
                         meld_tiles=rec_status.get("meld_tiles") or [],
                     )
