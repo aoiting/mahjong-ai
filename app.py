@@ -1,7 +1,9 @@
+import base64
 import hashlib
 import io
 import os
 import re
+from pathlib import Path
 
 import requests
 import streamlit as st
@@ -19,6 +21,13 @@ import yaku_hints as yh
 # 註：minimax-m3.1-flash:free 免費期已於 2026-10-22 結束；Gemini 喺香港被地區封鎖。
 DEFAULT_VISION_MODEL = "meta/muse-spark-1.3-contributor"
 DEFAULT_ANALYSIS_MODEL = "meta/muse-spark-1.3-contributor"
+
+_LOGO_SVG = Path(__file__).with_name("logo.svg")
+_LOGO_PNG = Path(__file__).with_name("logo.png")
+_LOGO_URI = (
+    "data:image/svg+xml;base64,"
+    + base64.b64encode(_LOGO_SVG.read_bytes()).decode("ascii")
+)
 
 HONOR_LABELS = {"1z": "東", "2z": "南", "3z": "西", "4z": "北", "5z": "白", "6z": "發", "7z": "中"}
 SUIT_LABELS = {"m": "萬", "p": "筒", "s": "索"}
@@ -462,8 +471,8 @@ def openrouter_connected(key: str) -> bool:
 
 # ── 頁面設定 ────────────────────────────────────────────────
 st.set_page_config(
-    page_title="日本麻雀 AI 牌局分析助手",
-    page_icon="🀄",
+    page_title="Riichi Lens 立直鏡",
+    page_icon=str(_LOGO_PNG),
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -517,9 +526,13 @@ button[data-baseweb="tab"][aria-selected="true"]{color:var(--gold);}
 /* header */
 .mj-header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:6px;}
 .mj-brand{display:flex;align-items:center;gap:12px;}
-.mj-logo{font-size:34px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4));}
-.mj-title{font-size:1.55rem;font-weight:800;color:var(--text);line-height:1.15;margin:0;}
-.mj-sub{font-size:.85rem;color:var(--muted);margin:2px 0 0;}
+.mj-logo{display:block;width:44px;height:44px;object-fit:contain;flex:0 0 44px;
+  filter:drop-shadow(0 2px 4px rgba(0,0,0,.4));}
+.mj-brand-text{display:flex;flex-direction:column;gap:2px;}
+.mj-title-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+.mj-title{font-size:1.7rem;font-weight:800;color:var(--text);line-height:1.05;margin:0;}
+.mj-title-zh{font-size:1.08rem;font-weight:700;color:var(--gold);line-height:1.1;}
+.mj-sub{font-size:.82rem;color:var(--muted);margin:3px 0 0;line-height:1.2;}
 .mj-status{display:flex;gap:8px;flex-wrap:wrap;}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
   font-size:.78rem;border:1px solid var(--line);background:var(--panel2);color:var(--muted);}
@@ -535,7 +548,11 @@ button[data-baseweb="tab"][aria-selected="true"]{color:var(--gold);}
   background:var(--panel2);}
 @media (max-width: 640px){
   .mj-mobile-summary{display:block;}
-  .mj-title{font-size:1.2rem;}
+  .mj-logo{width:38px;height:38px;flex-basis:38px;}
+  .mj-title{font-size:1.35rem;}
+  .mj-title-zh{font-size:.95rem;}
+  .mj-title-row{gap:7px;}
+  .mj-sub{font-size:.76rem;}
   .mj-header{gap:8px;}
 }
 /* hero */
@@ -740,10 +757,13 @@ st.markdown(
     f"""
 <div class="mj-header">
   <div class="mj-brand">
-    <div class="mj-logo">🀄</div>
-    <div>
-      <div class="mj-title">日本麻雀 AI 助手</div>
-      <div class="mj-sub">入手牌 · 睇建議 · AI 解說</div>
+    <img class="mj-logo" src="{_LOGO_URI}" alt="Riichi Lens 立直鏡 logo">
+    <div class="mj-brand-text">
+      <div class="mj-title-row">
+        <div class="mj-title">Riichi Lens</div>
+        <div class="mj-title-zh">立直鏡</div>
+      </div>
+      <div class="mj-sub">日本麻雀 AI 助手</div>
     </div>
   </div>
   <div class="mj-status">
