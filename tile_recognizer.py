@@ -477,6 +477,22 @@ def estimate_tile_count(boxes: list[tuple[int, int]]) -> int:
     return max(1, round((span - draw_gap) / pitch))
 
 
+def _filter_height_band(
+    boxes: list[tuple[int, int, int, int]], region: str
+) -> list[tuple[int, int, int, int]]:
+    """按區域嘅牌高帶過濾；手牌直立牌同副露瞓低牌用唔同容忍度。"""
+    if not boxes:
+        return boxes
+    med_h = median([y1 - y0 for _x0, _x1, y0, y1 in boxes])
+    if med_h <= 0:
+        return boxes
+    lo, hi = (0.70, 1.35) if region == "hand" else (0.45, 1.90)
+    return [
+        box for box in boxes
+        if lo * med_h <= (box[3] - box[2]) <= hi * med_h
+    ]
+
+
 def split_hand_layout(img: Image.Image, max_tiles: int = 20) -> dict | None:
     """用連通元件切手牌＋副露；只喺偵測到明顯副露區先回傳 dict。
 
@@ -504,6 +520,10 @@ def split_hand_layout(img: Image.Image, max_tiles: int = 20) -> dict | None:
         x, y, w, h, area = (int(v) for v in st[i])
         if area < 800 or w < 18 or h < 18:
             continue
+        # 牌格一定係接近方形／直立長方形；背景白色漩渦會係好闊嘅橫條。
+        long_side, short_side = max(w, h), min(w, h)
+        if long_side > 2.2 * short_side:
+            continue
         comps.append((x, y, w, h))
     comps.sort(key=lambda b: b[0])
     if not 13 <= len(comps) <= max_tiles:
@@ -521,6 +541,8 @@ def split_hand_layout(img: Image.Image, max_tiles: int = 20) -> dict | None:
     idx = best[1]
     hand = [(x, x + w, y, y + h) for x, y, w, h in comps[:idx]]
     meld = [(x, x + w, y, y + h) for x, y, w, h in comps[idx:]]
+    hand = _filter_height_band(hand, "hand")
+    meld = _filter_height_band(meld, "meld")
     if len(hand) < 2 or len(meld) < 3:
         return None
     return {"hand": hand, "meld": meld}
