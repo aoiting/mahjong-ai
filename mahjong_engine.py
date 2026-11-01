@@ -32,6 +32,21 @@ def tile_label(index34: int) -> str:
     return f"{index34 - 26}z"
 
 
+TILE_INDEX = {tile_label(i): i for i in range(34)}
+
+
+def _visible_counts(meld_groups: list[list[str]]) -> list[int]:
+    """副露牌喺牌河層面已經見到，計剩餘張數時要扣。"""
+    counts = [0] * 34
+    for group in meld_groups:
+        for tile in group:
+            label = tile[:-1] if tile.endswith("r") else tile
+            idx = TILE_INDEX.get(label)
+            if idx is not None:
+                counts[idx] += 1
+    return counts
+
+
 def _split(hand: str) -> dict[str, str]:
     out = {"man": "", "pin": "", "sou": "", "honors": ""}
     for digits, suit in re.findall(r"(\d+)([mpsz])", hand or ""):
@@ -65,16 +80,25 @@ def _dora_indicators(dora: str) -> list[int]:
     return tiles[:1]
 
 
-def _ukeire(tiles34: list[int], shanten: int) -> list[tuple[int, int]]:
-    """回傳 [(牌索引, 剩餘張數)]，只計可以令向聽下降嘅牌。"""
+def _ukeire(
+    tiles34: list[int],
+    shanten: int,
+    visible34: list[int] | None = None,
+) -> list[tuple[int, int]]:
+    """回傳 [(牌索引, 剩餘張數)]，只計可以令向聽下降嘅牌。
+
+    `visible34` 係手牌以外已經見到嘅牌（例如副露），計剩餘張數時要扣埋。
+    """
+    visible34 = visible34 or [0] * 34
     result = []
     for i in range(34):
-        if tiles34[i] >= 4:
+        seen = tiles34[i] + visible34[i]
+        if seen >= 4:
             continue
         probe = list(tiles34)
         probe[i] += 1
         if _SHANTEN.calculate_shanten(probe) < shanten:
-            result.append((i, 4 - tiles34[i]))
+            result.append((i, 4 - seen))
     return result
 
 
@@ -195,6 +219,11 @@ def format_facts(result: dict[str, Any]) -> str:
 
     lines = ["【精算結果（由計算引擎算出，必須遵從）】"]
     lines.append(f"- 手牌張數：{result['tiles']} 張")
+    if result.get("meld_count"):
+        lines.append(
+            f"- 副露：{result['meld_count']} 組（每組當 3 張，"
+            f"有效 {result['effective_tiles']} 張）"
+        )
     lines.append(f"- 向聽數：{result['shanten']}")
 
     if result.get("waits"):
@@ -238,12 +267,17 @@ def format_facts(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
-    """精算手牌。
+def analyze(
+    hand: str,
+    ctx: dict[str, Any] | None = None,
+    meld_groups: list[list[str]] | None = None,
+) -> dict[str, Any]:
+    """精算手牌；有副露時只計散牌，副露組當完成組固定。
 
     Args:
-        hand: 壓縮記法手牌（13 或 14 張）。
+        hand: 散牌壓縮記法；副露組每組當 3 張，所以有 1 組時手牌為 10/11 張。
         ctx: 含 bakaze / jikaze / dora。
+        meld_groups: 副露分組，例如 [["5sr", "5s", "5s"]]；槓都係一組。
 
     Returns:
         dict，包含 shanten、ukeire、discards、agari、summary；失敗時含 error。
@@ -252,6 +286,7 @@ def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
     hand = (hand or "").strip()
     if not hand:
         return {"error": "沒有手牌。"}
+    meld_groups = [list(group) for group in (meld_groups or []) if group]
 
     try:
         tiles34 = to_34(hand)
@@ -259,14 +294,32 @@ def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
         return {"error": f"手牌格式無法解析：{exc}"}
 
     n = sum(tiles34)
-    if n not in (13, 14):
+    meld_count = len(meld_groups)
+    effective_n = n + 3 * meld_count
+    if meld_count:
+        if effective_n not in (13, 14):
+            return {
+                "error": (
+                    f"手牌 {n} 張＋副露 {meld_count} 組"
+                    f"（有效 {effective_n} 張），精算只支援 13 或 14 張。"
+                )
+            }
+    elif n not in (13, 14):
         return {"error": f"手牌有 {n} 張，精算只支援 13 或 14 張。"}
 
+    visible34 = _visible_counts(meld_groups)
     shanten = _SHANTEN.calculate_shanten(tiles34)
     result: dict[str, Any] = {"tiles": n, "shanten": shanten}
+    if meld_count:
+        result["meld_count"] = meld_count
+        result["effective_tiles"] = effective_n
 
     # 已經和牌
     if shanten == -1:
+        if meld_count:
+            # 副露手唔用門清和牌計算，避免計錯役種／點數。
+            result["summary"] = "**已經和牌**（副露手；未計算點數）"
+            return result
         labels = [tile_label(i) for i in range(34) for _ in range(tiles34[i])]
         win_label = labels[-1] if labels else ""
         agari = {}
@@ -278,17 +331,17 @@ def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
         result["summary"] = _summary_agari(agari)
         return result
 
-    # 13 張：直接計有效牌
-    if n == 13:
-        uke = _ukeire(tiles34, shanten)
+    # 13 張（或副露後有效 13 張）：直接計有效牌
+    if effective_n == 13:
+        uke = _ukeire(tiles34, shanten, visible34)
         result["ukeire"] = [(tile_label(i), c) for i, c in uke]
         result["waits"] = [(tile_label(i), c) for i, c in uke] if shanten == 0 else []
         result["summary"] = _summary_shanten(shanten, result["ukeire"])
-        if shanten == 0:
+        if shanten == 0 and not meld_count:
             result["agari_preview"] = _tenpai_preview(hand, result["ukeire"], ctx)
         return result
 
-    # 14 張：逐張切牌比較
+    # 14 張（或副露後有效 14 張）：逐張切牌比較
     discards = []
     for i in range(34):
         if tiles34[i] == 0:
@@ -296,7 +349,7 @@ def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
         probe = list(tiles34)
         probe[i] -= 1
         s = _SHANTEN.calculate_shanten(probe)
-        uke = _ukeire(probe, s)
+        uke = _ukeire(probe, s, visible34)
         discards.append(
             {
                 "tile": tile_label(i),
@@ -312,8 +365,8 @@ def analyze(hand: str, ctx: dict[str, Any] | None = None) -> dict[str, Any]:
     result["best"] = best
     result["summary"] = _summary_discards(shanten, best)
 
-    # 若切牌後聽牌，預覽役種
-    if best and best["shanten"] == 0 and best["ukeire"]:
+    # 若切牌後聽牌，預覽役種（副露手暫停用門清和牌預覽）
+    if best and best["shanten"] == 0 and best["ukeire"] and not meld_count:
         tiles13 = list(tiles34)
         idx = next(j for j in range(34) if tile_label(j) == best["tile"])
         tiles13[idx] -= 1

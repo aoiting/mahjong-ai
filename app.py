@@ -307,8 +307,18 @@ def local_statuses() -> dict:
 
 
 @st.cache_data(show_spinner=False, max_entries=50)
-def cached_calc(hand: str, bakaze: str, jikaze: str, dora: str) -> dict:
-    return me.analyze(hand, {"bakaze": bakaze, "jikaze": jikaze, "dora": dora})
+def cached_calc(
+    hand: str,
+    bakaze: str,
+    jikaze: str,
+    dora: str,
+    meld_groups: tuple[tuple[str, ...], ...] = (),
+) -> dict:
+    return me.analyze(
+        hand,
+        {"bakaze": bakaze, "jikaze": jikaze, "dora": dora},
+        meld_groups=[list(group) for group in meld_groups],
+    )
 
 
 # 高手立直率（來源：天鳳 1194 場高手牌局、首次聽牌點統計）
@@ -891,8 +901,13 @@ if plain_hand:
     direction_hints, confirmed_yaku = yh.inspect(
         plain_hand, bakaze, jikaze, int(meld_count), meld_flat or None
     )
-    if not meld_flat:
-        calc = cached_calc(plain_hand, bakaze, jikaze, dora.strip())
+    calc = cached_calc(
+        plain_hand,
+        bakaze,
+        jikaze,
+        dora.strip(),
+        tuple(tuple(group) for group in meld_tiles),
+    )
 
 if hand_tiles and mlp.available():
     preds, preds_err = mlp.suggest(
@@ -1251,11 +1266,6 @@ with bottom_right:
         st.caption("純牌效率：向聽＋進張數，唔計役種")
         if not plain_hand:
             st.caption("入手牌後即時計算。")
-        elif meld_flat:
-            st.caption("副露手牌：牌理分析暫只支援門清 13/14 張。")
-            st.markdown("**🏆 役種**")
-            st.markdown(f"- 已確定役牌：{'、'.join(confirmed_yaku) or '暫無'}")
-            st.markdown(f"- 潛在方向：{direction_hints}")
         elif calc.get("error"):
             st.warning(calc["error"])
         else:
