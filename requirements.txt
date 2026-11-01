@@ -15,7 +15,7 @@ scikit-learn>=1.3
 joblib>=1.3
 
 # 本機手牌辨識（模板比對）
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 numpy>=1.25.0
 
 # 註：Ollama 本機視覺模型唔使裝 Python 套件，
