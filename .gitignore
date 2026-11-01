@@ -164,3 +164,7 @@ cython_debug/
 #.idea/
 train/mjlog2mjai/
 train/
+
+# Local secrets / environment
+.streamlit/secrets.toml
+.env

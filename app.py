@@ -7,7 +7,7 @@ from pathlib import Path
 
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 
 import ai_client as ai
 import mahjong_engine as me
@@ -193,6 +193,12 @@ def set_hand(
 _RECOGNIZE_CACHE: dict[str, tuple[str, str, str | None, list | None]] = {}
 
 
+def _oriented_preview(image_bytes: bytes) -> Image.Image:
+    """Preview 用：跟 EXIF 方向轉正；冇 EXIF 時等同原本圖片。"""
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        return ImageOps.exif_transpose(img).convert("RGB")
+
+
 def _recognize_now(
     image_bytes: bytes,
     engine: str,
@@ -204,7 +210,7 @@ def _recognize_now(
     local_first: bool = False,
     status: dict | None = None,
 ) -> tuple[str | None, str]:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
     image = tr.crop_hand_region(image, bottom_pct)
 
     if engine == "auto":
@@ -701,12 +707,18 @@ with st.sidebar:
         analysis_model = DEFAULT_ANALYSIS_MODEL
 
         if provider == "openrouter":
-            api_key = st.text_input(
+            manual_key = st.text_input(
                 "OpenRouter API Key",
                 type="password",
-                value=saved_key,
-                placeholder="sk-or-v1-...",
+                value="",
+                key="manual_openrouter_key",
+                placeholder="貼上 OpenRouter API Key",
             )
+            api_key = saved_key or manual_key.strip()
+            if saved_key:
+                st.caption("🔐 已由 Secrets 載入 API Key（唔會顯示喺畫面）。")
+            elif not manual_key:
+                st.caption("未偵測到 Secrets；可在此手動輸入，唔會寫入 repo。")
             vision_model = st.text_input(
                 "手牌辨識模型",
                 value=get_secret("OPENROUTER_VISION_MODEL", default=DEFAULT_VISION_MODEL),
@@ -808,18 +820,15 @@ with st.container(key="input_card", border=True):
             accept_multiple_files=False,
             label_visibility="visible",
         )
-        camera_open = st.toggle("📷 用相機影", key="camera_open")
-        camera_image = (
-            st.camera_input("對準手牌影相", key="camera_input")
-            if camera_open else None
-        )
         st.caption("💡 截圖辨識率最高；實體相片若因光線／角度認錯，可於下方逐隻修改。")
 
-        source_image = uploaded_image if uploaded_image is not None else camera_image
-        if source_image is not None:
-            source_label = "圖片上傳" if uploaded_image is not None else "相機拍攝"
-            image_caption = "已上傳的圖片" if uploaded_image is not None else "相機拍攝"
-            st.image(source_image, caption=image_caption, width="stretch")
+        if uploaded_image is not None:
+            source_bytes = uploaded_image.getvalue()
+            st.image(
+                _oriented_preview(source_bytes),
+                caption="已上傳的圖片",
+                width="stretch",
+            )
             with st.expander("🔍 裁剪設定", expanded=False):
                 bottom_pct = st.slider(
                     "只分析畫面底部百分比", 15, 100, 100, 5,
@@ -833,7 +842,7 @@ with st.container(key="input_card", border=True):
                 rec_status: dict = {}
                 with st.spinner("辨識中..."):
                     hand, msg = cached_recognize(
-                        source_image.getvalue(), engine, provider, api_key,
+                        source_bytes, engine, provider, api_key,
                         vision_model, force=do_force, bottom_pct=bottom_pct,
                         per_tile=per_tile, local_first=local_first,
                         status=rec_status,
@@ -841,7 +850,7 @@ with st.container(key="input_card", border=True):
                 st.session_state["recognize_msg"] = msg
                 if hand:
                     set_hand(
-                        ti.expand_hand(hand), source_label,
+                        ti.expand_hand(hand), "圖片上傳",
                         recognized=True, drawn=rec_status.get("drawn"),
                         meld_tiles=rec_status.get("meld_tiles") or [],
                     )
