@@ -20,6 +20,7 @@ import io
 import os
 import re
 from pathlib import Path
+from statistics import median
 
 import numpy as np
 from PIL import Image
@@ -307,17 +308,90 @@ def tile_shape_hint(tile: Image.Image) -> str:
     return tile_shape_analysis(tile)[0]
 
 
+def _segments_from_gap(
+    gap, min_width: int = 20
+) -> list[tuple[int, int]]:
+    """由「係縫隙」嘅 column mask 抽出非縫隙區段。"""
+    segs: list[tuple[int, int]] = []
+    start = None
+    for i, g in enumerate(gap):
+        if not g and start is None:
+            start = i
+        elif g and start is not None:
+            segs.append((start, i - 1))
+            start = None
+    if start is not None:
+        segs.append((start, len(gap) - 1))
+    return [(s, e) for s, e in segs if e - s + 1 >= min_width]
+
+
+def _boxes_from_segments(
+    segs: list[tuple[int, int]], h: int, max_tiles: int
+) -> tuple[list[tuple[int, int]] | None, float]:
+    """由區段估牌距並切牌；回傳 (boxes 或 None, fit score)。"""
+    if not segs:
+        return None, 9e9
+    widths = [e - s + 1 for s, e in segs]
+
+    def fit_score(p: float) -> float:
+        if p < 25:
+            return 9e9
+        err = 0.0
+        for wd in widths:
+            r = wd / p
+            err += abs(r - round(r))
+        return err / len(widths)
+
+    # 分開放置嘅單隻牌（例如摸牌）可以提供最可靠嘅單牌闊度
+    isolated: list[float] = []
+    lo_w = 0.5 * (h / 1.58)
+    hi_w = 1.5 * (h / 1.58)
+    for i, (s0, e0) in enumerate(segs):
+        w0 = e0 - s0 + 1
+        if not (lo_w <= w0 <= hi_w):
+            continue
+        left_gap = (s0 - segs[i - 1][1]) if i > 0 else 10**9
+        right_gap = (segs[i + 1][0] - e0) if i < len(segs) - 1 else 10**9
+        if max(left_gap, right_gap) >= 0.35 * w0:
+            isolated.append(float(w0))
+
+    candidates = [float(min(widths)), h / 1.58] + isolated
+
+    def score(p: float) -> float:
+        return fit_score(p) - (0.05 if p in isolated else 0)
+
+    pitch = min(candidates, key=score)
+    score = fit_score(pitch)
+
+    if pitch < 25 or pitch > 260:
+        return None, score
+    if score > 0.22:  # 解釋唔到 → 唔似整齊手牌條
+        return None, score
+
+    boxes: list[tuple[int, int]] = []
+    for s, e in segs:
+        span = e - s + 1
+        n = max(1, round(span / pitch))
+        step = span / n
+        if step < 25:
+            return None, score
+        for i in range(n):
+            boxes.append((int(round(s + i * step)), int(round(s + (i + 1) * step))))
+
+    if not 2 <= len(boxes) <= max_tiles:
+        return None, score
+    return boxes, score
+
+
 def split_hand_tiles(
     img: Image.Image, max_tiles: int = 18
 ) -> list[tuple[int, int]] | None:
     """由「一手牌橫條」自動切出每張牌嘅左右邊界。
 
-    純背景色偵測，完全離線、零成本、零 API。
-    做法：四角估背景色 → 每 column 有幾多比例屬背景 → 自相關估牌距 →
-    以明顯縫隙分組（摸牌同手牌之間通常有個大空隙）→ 每組平均切開。
-
-    適用於雀魂／天鳳等固定畫面嘅手牌條；
-    實體牌相片或完整遊戲截圖會回 None（交由「整條 AI 辨識」處理）。
+    純本地、零成本、零 API。會試兩種縫隙偵測：
+      1. 背景色差異（適合一般淺色／深色底）
+      2. 藍色底偵測（適合深藍底、牌與牌之間只剩 1–2px 縫嘅遊戲截圖）
+    每種方法各自估牌距；最後揀 13/14 張而且 fit 最好嘅結果。
 
     Returns:
         [(x0, x1), ...]（由左至右），或 None 代表切唔到。
@@ -338,62 +412,118 @@ def split_hand_tiles(
     ])
     bg = corners.mean(axis=0)
 
-    # 2) 每個 column 屬背景嘅比例
+    # 2) 背景色差異 mask
     col_bg = (np.abs(a - bg).sum(axis=2) < 90).mean(axis=0)
 
-    # 3) 非背景區段（每段可能係 1 張或幾張牌）
-    gap = col_bg > 0.55
-    segs: list[tuple[int, int]] = []
-    start = None
-    for i, g in enumerate(gap):
-        if not g and start is None:
-            start = i
-        elif g and start is not None:
-            segs.append((start, i - 1))
-            start = None
-    if start is not None:
-        segs.append((start, len(gap) - 1))
-    segs = [(s, e) for s, e in segs if e - s + 1 >= 20]
-    if not segs:
+    # 3) 深藍底 mask（藍色主導嘅 pixel 當背景）
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    blue = ((b > r + 12) & (b > g + 6)).mean(axis=0)
+    corners_blue = float(
+        ((corners[:, 2] > corners[:, 0] + 12) & (corners[:, 2] > corners[:, 1] + 6)).mean()
+    )
+
+    bg_segs = _segments_from_gap(col_bg > 0.55)
+    bg_boxes, bg_score = _boxes_from_segments(bg_segs, h, max_tiles)
+
+    # 只有真係藍底（或藍色 mask 明顯切到多段）先用第二種方法，
+    # 避免一般淺色底被誤切。
+    blue_segs = _segments_from_gap(blue > 0.5)
+    blue_boxes, blue_score = (None, 9e9)
+    if corners_blue > 0.5 or len(blue_segs) >= 3:
+        blue_boxes, blue_score = _boxes_from_segments(blue_segs, h, max_tiles)
+
+    bg_ok = bool(bg_boxes) and len(bg_boxes) in (13, 14)
+    blue_ok = bool(blue_boxes) and len(blue_boxes) in (13, 14)
+
+    # 背景色方法本身 OK 就沿用，除非藍色方法明顯更整齊。
+    if bg_ok and not (blue_ok and blue_score < bg_score * 0.35):
+        chosen = bg_boxes
+    elif blue_ok:
+        chosen = blue_boxes
+    elif bg_boxes:
+        chosen = bg_boxes
+    else:
+        chosen = blue_boxes
+
+    if not chosen:
         return None
 
-    widths = [e - s + 1 for s, e in segs]
+    # 格闊異常：任何一格 > 中位數 1.35 倍 → 當兩隻黐埋，中間對半切
+    med = median([b - a for a, b in chosen])
+    widened: list[tuple[int, int]] = []
+    for a, b in chosen:
+        if med > 0 and (b - a) > 1.35 * med:
+            mid = (a + b) // 2
+            widened.extend([(a, mid), (mid, b)])
+        else:
+            widened.append((a, b))
+    if len(widened) != len(chosen) and len(widened) in (13, 14):
+        chosen = widened
+    return chosen
 
-    # 4) 估牌距。區段寬度係牌距嘅整數倍，所以可以用「最窄嘅區段」做候選；
-    #    再加「由牌高推算」（麻雀牌大約 1 : 1.58）做第二候選，
-    #    揀最能解釋所有區段寬度嘅嗰個。
-    def fit_score(p: float) -> float:
-        if p < 25:
-            return 9e9
-        err = 0.0
-        for wd in widths:
-            r = wd / p
-            err += abs(r - round(r))
-        return err / len(widths)
 
-    candidates = [float(min(widths)), h / 1.58]
-    pitch = min(candidates, key=fit_score)
+def estimate_tile_count(boxes: list[tuple[int, int]]) -> int:
+    """由切出嘅格估圖入面實際有幾多隻牌（用起點間距，扣摸牌大空隙）。"""
+    if len(boxes) < 2:
+        return len(boxes)
+    starts = [a for a, _ in boxes]
+    pitches = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+    pitch = median(pitches)
+    if pitch <= 0:
+        return len(boxes)
+    gaps = [boxes[i + 1][0] - boxes[i][1] for i in range(len(boxes) - 1)]
+    draw_gap = sum(g for g in gaps if g > 0.4 * pitch)
+    span = boxes[-1][1] - boxes[0][0]
+    return max(1, round((span - draw_gap) / pitch))
 
-    if pitch < 25 or pitch > 260:
+
+def split_hand_layout(img: Image.Image, max_tiles: int = 20) -> dict | None:
+    """用連通元件切手牌＋副露；只喺偵測到明顯副露區先回傳 dict。
+
+    Returns:
+        {"hand": [(x0,x1,y0,y1), ...], "meld": [...]} 或 None（用返 split_hand_tiles）
+    """
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001
         return None
-    if fit_score(pitch) > 0.18:  # 解釋唔到 → 唔似整齊手牌條
-        return None
-
-    # 5) 每段平均切成 n 張
-    boxes: list[tuple[int, int]] = []
-    for s, e in segs:
-        span = e - s + 1
-        n = max(1, round(span / pitch))
-        step = span / n
-        if step < 25:
+    try:
+        a = np.asarray(img.convert("RGB"))
+        mx = a.max(axis=2)
+        mn = a.min(axis=2)
+        mask = ((mx > 145) & ((mx - mn) < 70)).astype(np.uint8) * 255
+        if mask.sum() == 0:
             return None
-        for i in range(n):
-            boxes.append((int(round(s + i * step)), int(round(s + (i + 1) * step))))
-
-    # 6) 只接受合理手牌張數
-    if not 2 <= len(boxes) <= max_tiles:
+        m = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=2)
+        n, _lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    except Exception:  # noqa: BLE001
         return None
-    return boxes
+
+    comps: list[tuple[int, int, int, int]] = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in st[i])
+        if area < 800 or w < 18 or h < 18:
+            continue
+        comps.append((x, y, w, h))
+    comps.sort(key=lambda b: b[0])
+    if not 13 <= len(comps) <= max_tiles:
+        return None
+
+    med = median([b[2] for b in comps])
+    best: tuple[float, int] | None = None
+    for i in range(len(comps) - 3):
+        jump = comps[i + 1][0] - comps[i][0]
+        if jump >= 1.5 * med and (best is None or jump > best[0]):
+            best = (float(jump), i + 1)
+    if best is None:
+        return None
+
+    idx = best[1]
+    hand = [(x, x + w, y, y + h) for x, y, w, h in comps[:idx]]
+    meld = [(x, x + w, y, y + h) for x, y, w, h in comps[idx:]]
+    if len(hand) < 2 or len(meld) < 3:
+        return None
+    return {"hand": hand, "meld": meld}
 
 
 def crop_hand_region(img: Image.Image, bottom_pct: int = 100) -> Image.Image:

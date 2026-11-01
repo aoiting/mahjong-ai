@@ -62,8 +62,8 @@ def main() -> None:
         key,
         boxes,
         model,
-        progress=lambda done, total, tiles: print(f"  {done}/{total}: {tiles[-1]}", flush=True),
-        local_first=True,
+        progress=lambda done, total, tiles: print(f"  {done}/{total}", flush=True),
+        local_first=False,
     )
     print("HAND:", hand)
     print("MSG:", msg)

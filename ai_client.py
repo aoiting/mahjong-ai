@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import re
+import threading
 import time
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from PIL import Image
@@ -29,7 +33,9 @@ DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "meta/muse-spark-1.3-contribu
 # 700 太細：真實截圖會令模型思考好長，thinking 食晒預算就冇 content。
 VISION_MAX_TOKENS = 4000
 # 免費 reasoning 模型會先用大量 token 思考，上限太低會令答案被截斷
-ANALYSIS_MAX_TOKENS = 6000
+ANALYSIS_MAX_TOKENS = 1200
+# 串流模式：解說目標只係 250–350 字，配合 reasoning effort
+STREAM_MAX_TOKENS = 1200
 
 # 視覺辨識備援模型（按實測可靠度排序；第一個掛咗就試下一個）
 # 註：minimax-m3.1-flash:free 嘅免費期已於 2026-10-22 結束，唔可以再用。
@@ -39,12 +45,13 @@ VISION_FALLBACK_MODELS = [
     "meta/muse-glimmer-30b",
 ]
 
-# 分析備援模型（免費、有正式文字輸出）
+# 分析備援模型：優先留在 Muse 家族（1.3-contributor 只有 Meta 一個 provider，
+# 部分地區／熄 VPN 後會 403），最後才用免費 Nemotron。
 ANALYSIS_FALLBACK_MODELS = [
+    "meta/muse-spark-open",
+    "meta/muse-glimmer-30b",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
-    "nvidia/nemotron-3.5-lightning:free",
-    "poolside/laguna-s-2.1:free",
 ]
 
 VISION_PROMPT = """你係日本麻雀（立直麻雀）牌面辨識器。請辨識圖片中「手牌」嘅 13 或 14 張牌。
@@ -54,12 +61,12 @@ VISION_PROMPT = """你係日本麻雀（立直麻雀）牌面辨識器。請辨�
 2. 筒子（p）：數圓形圖案數量。
    - 1筒：一個特大嘅花形圓圈
    - 2～9筒：2 至 9 個細圓圈，按固定排列（5筒排成 X、3筒斜線）
-3. 索子（s）：數竹節數量。
+3. 索子（s）：數竹節數量。竹枝可以斜放；八索係 4 直 4 斜嘅編織形，斜竹都要計。
    - 1索：一隻雀鳥圖案
    - 2～9索：2 至 9 支垂直竹枝
 4. 風牌：一個大字 —— 東、南、西、北。
 5. 三元牌：紅「中」、綠「發」、白（空白或有藍／黑外框）。
-6. 赤牌（紅色 5）一律當作普通 5，唔使特別標示。
+6. 赤牌：成隻 5 嘅圖案全部係紅色 → 用 5mr／5pr／5sr 標示；只有中間一個圖案係紅色（五筒中間紅圈、五索中間紅竹）→ 係普通 5，照寫 5p／5s。
 7. 只數「自己嘅手牌」，唔要數牌河、其他家、或者 UI 上面嘅圖示。
 
 【輸出格式】
@@ -133,6 +140,23 @@ def _friendly_error(status: int | None, detail: str = "") -> str:
     return f"{base} {detail}".strip()
 
 
+def _short_reason(msg: str, limit: int = 40) -> str:
+    """把長長嘅錯誤訊息縮成一句人話（用喺「已轉用備援」提示）。"""
+    t = (msg or "").strip().replace("\n", " ")
+    low = t.lower()
+    if "地區" in t or "region" in low:
+        return "地區限制"
+    if "餘額" in t or "credits" in low or "402" in t:
+        return "額度不足"
+    if "逾時" in t:
+        return "請求逾時"
+    if "502" in t:
+        return "上游暫時失敗"
+    if "429" in t or "頻繁" in t:
+        return "請求太頻繁"
+    return t[:limit]
+
+
 def _post(path: str, api_key: str, payload: dict, timeout: float) -> dict:
     """POST 到 OpenRouter，回傳 JSON；失敗拋 AIError。"""
     if not api_key or not api_key.strip():
@@ -159,6 +183,145 @@ def _post(path: str, api_key: str, payload: dict, timeout: float) -> dict:
         return r.json()
     except ValueError as exc:
         raise AIError("伺服器回傳非 JSON 格式。") from exc
+
+
+def _iter_stream(resp) -> Iterator[str]:
+    """由 OpenRouter SSE 回應逐段抽出文字。
+
+    注意：`iter_lines(decode_unicode=True)` 會用 response.encoding
+    （OpenRouter 嘅 event-stream 冇 charset，會當 ISO-8859-1），
+    令中文變亂碼。所以呢度自己用 UTF-8 解碼 bytes。
+    """
+    for raw in resp.iter_lines(decode_unicode=False):
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        if not data:
+            continue
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        for choice in obj.get("choices") or []:
+            piece = (choice.get("delta") or {}).get("content")
+            if piece:
+                yield piece
+
+
+def _open_stream(api_key: str, payload: dict, timeout: float):
+    """開始串流請求；非 200 直接拋 AIError。"""
+    if not api_key or not api_key.strip():
+        raise AIError("未提供 OpenRouter API Key。")
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/chat/completions",
+            headers=_headers(api_key.strip()),
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        )
+    except requests.Timeout as exc:
+        raise AIError(f"請求逾時（{timeout:.0f} 秒），請重試。") from exc
+    except requests.RequestException as exc:
+        raise AIError(f"網絡錯誤：{exc}") from exc
+
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = (resp.json().get("error") or {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            detail = resp.text[:200]
+        resp.close()
+        raise AIError(_friendly_error(resp.status_code, detail))
+    return resp
+
+
+def _stream_effort(model: str) -> str:
+    """串流用嘅 reasoning effort。
+
+    實測：`meta/muse-spark-1.*` 係「強制 reasoning」模型，effort=low 會用盡
+    800 tokens 思考而回傳 0 字；effort=minimal 先可以喺 800 內出到內容。
+    其他模型照 brief 用 low。
+    """
+    return "minimal" if "muse-spark-1." in model else "low"
+
+
+def stream_analysis(
+    hand: str,
+    ctx: dict,
+    backend: str = "openrouter",
+    api_key: str = "",
+    model: str = DEFAULT_MODEL,
+    facts: str = "",
+    model_preds: str = "",
+    direction_hints: str = "無",
+    fallback_models: list[str] | None = None,
+    status: dict | None = None,
+) -> Iterator[str]:
+    """逐段 yield 分析文字（OpenRouter 串流）。
+
+    status：可選 dict，完成後會寫入 "model" 同 "primary_error"。
+    如果未 yield 任何字就失敗，會拋 AIError，交由 app fallback 去非串流。
+    """
+    status = status if status is not None else {}
+    if backend == "ollama":
+        raise AIError("本機 Ollama 模式唔支援串流。")
+
+    prompt = build_analysis_prompt(hand, ctx, facts, model_preds, direction_hints)
+
+    candidates = [model]
+    for alt in (fallback_models if fallback_models is not None else ANALYSIS_FALLBACK_MODELS):
+        if alt and alt not in candidates:
+            candidates.append(alt)
+
+    last_err = ""
+    primary_err = ""
+    for m in candidates:
+        base = {
+            "model": m,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": STREAM_MAX_TOKENS,
+            "temperature": 0.3,
+            "stream": True,
+        }
+        for use_reasoning in (True, False):
+            payload = dict(base)
+            if use_reasoning:
+                payload["reasoning"] = {"effort": _stream_effort(m)}
+            try:
+                resp = _open_stream(api_key, payload, timeout=300)
+            except AIError as exc:
+                last_err = str(exc)
+                if m == candidates[0] and not primary_err:
+                    primary_err = last_err
+                if use_reasoning and ("400" in last_err or "格式" in last_err):
+                    continue
+                break
+
+            emitted = 0
+            try:
+                for piece in _iter_stream(resp):
+                    emitted += 1
+                    yield piece
+            finally:
+                resp.close()
+
+            if emitted:
+                status["model"] = m
+                status["primary_error"] = primary_err
+                return
+
+            last_err = "模型回傳空內容。"
+            if m == candidates[0] and not primary_err:
+                primary_err = last_err
+            break
+
+    raise AIError(last_err or "分析失敗，請稍後再試。")
 
 
 def _message_text(data: dict) -> str:
@@ -212,19 +375,32 @@ PER_TILE_PROMPT = """呢張圖係一張日本麻雀牌（單張）。
 請只輸出一個代碼，唔要任何解釋、標點或多餘文字：
 - 萬子：1m～9m（有紅色「萬」字，上面有漢數字）
 - 筒子：1p～9p（圓圈；1p 係一個大花圈）
-- 索子：1s～9s（綠色竹枝；1s 係綠色雀鳥）
+- 索子：1s～9s（綠色竹枝（可以斜放）；1s 係綠色雀鳥）
 - 字牌：1z=東 2z=南 3z=西 4z=北 5z=白 6z=發 7z=中
 - 如果張牌完全空白、冇任何圖案 → 答 5z
+- 如果成隻 5 嘅圖案全部係紅色，答 5mr／5pr／5sr（赤牌）；如果只有中間一個圖案係紅色（五筒中間一粒紅圈、五索中間一支紅竹），嗰個係普通 5，照答 5p／5s，唔好當赤牌。
+
+【數牌規則】筒子數圈、索子數竹，要逐個數，斜放嘅都要計，唔好靠排版估。
+特別注意：八索係編織形 — 4 支直竹＋4 支斜竹織埋一齊，斜嗰啲唔係花紋，總數係 8；
+五索冇編織，中間嗰支多數紅色或橫放；七筒係 3 個黑圈斜排＋4 個紅圈；
+九筒／九索係 3×3 共 9 個。
+
 格式示範（唔好照抄，只示格式）：3p"""
 
 
 def _parse_single_tile(text: str) -> str | None:
-    """由模型回覆抽出單張牌代碼。"""
+    """由模型回覆抽出單張牌代碼（保留赤五 r 後綴）。"""
     if not text:
         return None
-    hand = tr.normalize_hand(text)
-    found = re.findall(r"\d[mpsz]", hand)
-    return found[0] if found else None
+    m = re.search(r"([0-9])([mpsz])(r?)", text.lower())
+    if not m:
+        return None
+    digit, suit, red = m.group(1), m.group(2), m.group(3)
+    if digit == "0":
+        digit, red = "5", "r"
+    if red and (suit == "z" or digit != "5"):
+        red = ""
+    return f"{digit}{suit}{red}"
 
 
 def _post_with_reasoning(
@@ -253,6 +429,7 @@ def _post_smart(
     payload: dict,
     timeout: float,
     budgets: tuple[int, ...] = (1000, 700, 400, 200),
+    effort: str = "low",
 ) -> dict:
     """強韌版呼叫：
 
@@ -276,7 +453,7 @@ def _post_smart(
             body = copy.deepcopy(payload)
             body["max_tokens"] = budget
             if use_reasoning:
-                body["reasoning"] = {"effort": "low"}
+                body["reasoning"] = {"effort": effort}
             try:
                 return _post(path, api_key, body, timeout)
             except AIError as exc:
@@ -331,6 +508,7 @@ def recognize_tile(
                 "temperature": 0,
             },
             timeout=240,
+            effort=_stream_effort(model),
         )
     except AIError as exc:
         return None, str(exc)
@@ -348,8 +526,18 @@ def local_hint(profile: dict, shape_text: str = "") -> str:
     形狀（窄長條 vs 圓形）比顏色可靠 ——
     呢個牌庫嘅 5s 係紅色竹枝，所以唔可以用「冇綠色」否定索子；
     但「發」(6z) 喺呢個牌庫一定係綠色（實測 0.187），所以冇綠色就一定唔係發。
+
+    全紅赤五（5mr／5pr／5sr）嘅裝飾紅點會被形狀分析多數一個圓形，
+    所以紅色比例高時，唔傳圈數提示，避免 AI 被「6 個圓形」誤導。
     """
     parts = []
+    high_red = profile.get("red", 0.0) >= 0.15 and profile.get("green", 0.0) < tr.GREEN_MIN
+    if high_red:
+        return (
+            "本地色彩分析：呢張牌幾乎全紅、冇黑墨，極可能係赤五（5mr／5pr／5sr），"
+            "唔係普通五。赤五筒＝4 個紅圈＋中間紅點，總數 5；赤五索＝紅色竹枝。"
+            "請逐個數清楚。"
+        )
     if shape_text:
         parts.append(shape_text)
     if profile["green"] >= tr.GREEN_MIN:
@@ -394,6 +582,7 @@ def _read_man_numeral(tile: Image.Image, api_key: str, model: str) -> int | None
                 "temperature": 0,
             },
             timeout=240,
+            effort=_stream_effort(model),
         )
     except AIError:
         return None
@@ -419,12 +608,26 @@ def _model_unusable(msg: str) -> bool:
             "training violation",
             "0 endpoints",
             "私隱設定封鎖",
+            "存取被拒",
+            "地區限制",
+            "region",
             "搵唔到模型",
             "無供應商",
             "api key 無效",
             "餘額不足",
         )
     )
+
+
+def _sorted_hand_tokens(tiles: list[str | None]) -> list[str]:
+    """按 m→p→s→z、數字穩定排序；赤五 r 唔參與 key。"""
+    order = {"m": 0, "p": 1, "s": 2, "z": 3}
+
+    def key(t: str) -> tuple[int, int]:
+        suit = t[-2] if t.endswith("r") else t[-1]
+        return (order.get(suit, 9), int(t[0]))
+
+    return sorted((t for t in tiles if t), key=key)
 
 
 def recognize_hand_per_tile(
@@ -435,13 +638,16 @@ def recognize_hand_per_tile(
     fallback_models: list[str] | None = None,
     progress=None,
     local_first: bool = False,
+    status: dict | None = None,
 ) -> tuple[str | None, str]:
     """先切牌、再逐張辨識。
 
     Args:
         boxes: [(x0, x1), ...]，由 tr.split_hand_tiles() 得出。
         progress: 可選 callback(done, total, tiles)。
-        local_first: True 就將本地形狀分析夠肯定嘅牌直接採用（省 API）。
+        local_first: 保留參數以兼容舊呼叫；現時唔會再直接採用本地形狀分析答案，
+            形狀分析只會作為提示傳俾 AI。唯一例外：空白牌 ink 判定直接當 5z。
+        status: 可選 dict，完成後會寫入 "drawn"（最後一個 box 認到嘅牌）。
 
     Returns:
         (hand, message)
@@ -451,44 +657,42 @@ def recognize_hand_per_tile(
         if alt and alt not in models:
             models.append(alt)
 
-    tiles: list[str | None] = []
-    errors: list[str] = []
-    dead: set[str] = set()
     total = len(boxes)
+    tiles: list[str | None] = [None] * total
+    dead: set[str] = set()
+    dead_lock = threading.Lock()
+    completed = 0
 
-    # 免費模型有嚴格速率限制（免費層約 20 次/分鐘），所以要節流；
-    # 付費模型冇呢個問題，可以快好多。
+    # 免費模型有嚴格速率限制（免費層約 20 次/分鐘），延遲只用喺萬子二次讀數字；
+    # 逐張請求改為並行（最多 5 隻）。
     primary = models[0] if models else ""
     delay = float(
         os.environ.get("MAHJONG_PER_TILE_DELAY")
         or (3.0 if primary.endswith(":free") else 0.5)
     )
 
+    pending: list[tuple[int, int, int, dict, str]] = []
     for idx, (x0, x1) in enumerate(boxes):
         crop = image.crop((x0, 0, x1, image.height))
-
-        # 本地快速通道：空白牌一定係「白」（5z），唔使問 AI
         profile = tr.tile_color_profile(crop)
+
+        # 本地快速通道：空白牌一定係「白」（5z），唔使入隊問 AI
         if profile["ink"] < tr.BLANK_INK_MAX:
-            tiles.append("5z")
+            tiles[idx] = "5z"
+            completed += 1
             if progress:
-                progress(idx + 1, total, tiles)
+                progress(completed, total, tiles)
             continue
 
-        hint_text, local_answer = tr.tile_shape_analysis(crop)
+        # 形狀分析只做提示，唔會再直接當答案（避免本地分析搶答難牌）
+        hint_text, _local_answer = tr.tile_shape_analysis(crop)
+        pending.append((idx, x0, x1, profile, hint_text))
 
-        # 省 API 模式：本地分析夠肯定就直接採用，唔使問 AI
-        if local_first and local_answer:
-            tiles.append(local_answer)
-            if progress:
-                progress(idx + 1, total, tiles)
-            continue
-
-        if idx > 0:
-            time.sleep(delay)  # 節流，避免觸發上游速率限制
-
+    def _work(item: tuple[int, int, int, dict, str]) -> tuple[int, str | None, str]:
+        idx, x0, x1, profile, hint_text = item
+        crop = image.crop((x0, 0, x1, image.height))
         hint = local_hint(profile, hint_text)
-        code = None
+        code: str | None = None
         last = ""
         used_model = ""
         # 主模型試 3 次（上游常有暫時性 502），失敗先逐個備援模型試 1 次。
@@ -496,7 +700,9 @@ def recognize_hand_per_tile(
         # 後面嘅牌就唔會再浪費時間重試。
         attempts = [(models[0], 3)] + [(m, 1) for m in models[1:]]
         for m, tries in attempts:
-            if m in dead:
+            with dead_lock:
+                is_dead = m in dead
+            if is_dead:
                 continue
             for attempt in range(tries):
                 code, msg = recognize_tile(crop, api_key, m, hint=hint)
@@ -505,7 +711,8 @@ def recognize_hand_per_tile(
                     break
                 last = msg
                 if _model_unusable(msg):
-                    dead.add(m)
+                    with dead_lock:
+                        dead.add(m)
                     break
                 time.sleep(1.5 * (attempt + 1))  # 退避重試
             if code:
@@ -518,23 +725,160 @@ def recognize_hand_per_tile(
             if n:
                 code = f"{n}m"
 
-        tiles.append(code)
-        if not code:
-            errors.append(f"第 {idx + 1} 張：{last}")
-        if progress:
-            progress(idx + 1, total, tiles)
+        return idx, code, last
 
+    error_map: dict[int, str] = {}
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(5, len(pending))) as pool:
+            futures = [pool.submit(_work, item) for item in pending]
+            for fut in as_completed(futures):
+                idx, code, last = fut.result()
+                tiles[idx] = code
+                completed += 1
+                if not code:
+                    error_map[idx] = last
+                if progress:
+                    progress(completed, total, tiles)
+
+    if status is not None:
+        status["drawn"] = tiles[-1] if tiles else None
+
+    errors = [f"第 {i + 1} 張：{error_map[i]}" for i in sorted(error_map)]
     good = [t for t in tiles if t]
     if len(good) < total * 0.7:
         detail = errors[0] if errors else "全部失敗"
         return None, f"逐張辨識失敗（只有 {len(good)}/{total} 張成功）。{detail}"
 
-    hand = tr.normalize_hand("".join(t or "" for t in tiles))
+    hand = " ".join(_sorted_hand_tokens(tiles))
     breakdown = " ".join(t or "?" for t in tiles)
     note = f"逐張辨識完成（{len(good)}/{total} 張）：{breakdown}"
     if errors:
         note += f"　⚠️ {len(errors)} 張要用備援／失敗，建議人手核對"
+    est = tr.estimate_tile_count(boxes)
+    if est and est != total:
+        note += (
+            f"\n⚠️ 切出 {total} 格，但幅圖估計有 {est} 隻牌，"
+            "可能切漏或切多，請逐隻核對。"
+        )
     return hand, note
+
+
+def _crop_box(image: Image.Image, box) -> Image.Image:
+    if len(box) == 4:
+        x0, x1, y0, y1 = box
+    else:
+        x0, x1 = box
+        y0, y1 = 0, image.height
+    return image.crop((x0, y0, x1, y1))
+
+
+def _is_wide_box(box) -> bool:
+    return len(box) == 4 and (box[1] - box[0]) > (box[3] - box[2])
+
+
+def group_meld_tiles(codes: list[str]) -> list[list[str]]:
+    """副露牌順序分組：每 3 隻一組；多出 1 隻併入前一組做槓（4 隻）。"""
+    items = [c for c in codes if c]
+    groups: list[list[str]] = []
+    i = 0
+    while i < len(items):
+        remain = len(items) - i
+        if remain == 1 and groups:
+            groups[-1].append(items[i])
+            i += 1
+        elif remain == 4:
+            groups.append(items[i:i + 4])
+            i += 4
+        else:
+            groups.append(items[i:i + 3])
+            i += 3
+    return groups
+
+
+def recognize_boxes(
+    image: Image.Image,
+    api_key: str,
+    boxes: list,
+    model: str,
+    fallback_models: list[str] | None = None,
+    progress=None,
+    rotate_wide: bool = True,
+) -> tuple[list[str], str]:
+    """按 box 次序辨識（支援 4-tuple，闊過高會旋轉 90 度）。"""
+    models = [model]
+    for alt in (fallback_models if fallback_models is not None else VISION_FALLBACK_MODELS):
+        if alt and alt not in models:
+            models.append(alt)
+
+    total = len(boxes)
+    results: list[str | None] = [None] * total
+    dead: set[str] = set()
+    dead_lock = threading.Lock()
+    completed = 0
+
+    pending = []
+    for idx, box in enumerate(boxes):
+        crop = _crop_box(image, box)
+        if tr.tile_color_profile(crop)["ink"] < tr.BLANK_INK_MAX:
+            results[idx] = "5z"
+            completed += 1
+            if progress:
+                progress(completed, total, results)
+            continue
+        pending.append((idx, box, crop))
+
+    def _work(item):
+        idx, box, crop = item
+        wide = rotate_wide and _is_wide_box(box)
+        variants = [crop]
+        if wide:
+            variants = [crop.transpose(Image.ROTATE_90), crop.transpose(Image.ROTATE_270)]
+        hint_text, _ = tr.tile_shape_analysis(crop)
+        hint = local_hint(tr.tile_color_profile(crop), hint_text)
+        code = None
+        last = ""
+        used_model = ""
+        attempts = [(models[0], 3)] + [(m, 1) for m in models[1:]]
+        for variant in variants:
+            for m, tries in attempts:
+                with dead_lock:
+                    is_dead = m in dead
+                if is_dead:
+                    continue
+                for attempt in range(tries):
+                    code, msg = recognize_tile(variant, api_key, m, hint=hint)
+                    if code:
+                        used_model = m
+                        break
+                    last = msg
+                    if _model_unusable(msg):
+                        with dead_lock:
+                            dead.add(m)
+                        break
+                    time.sleep(1.5 * (attempt + 1))
+                if code:
+                    break
+            if code:
+                break
+        if code and code.endswith("m"):
+            n = _read_man_numeral(variants[0], api_key, used_model or models[0])
+            if n:
+                code = f"{n}m"
+        return idx, code, last
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(5, len(pending))) as pool:
+            futs = [pool.submit(_work, item) for item in pending]
+            for fut in as_completed(futs):
+                idx, code, last = fut.result()
+                results[idx] = code
+                completed += 1
+                if progress:
+                    progress(completed, total, results)
+
+    good = [c for c in results if c]
+    breakdown = " ".join(c or "?" for c in results)
+    return [c for c in results if c], f"（{len(good)}/{total}）{breakdown}"
 
 
 def check_key(api_key: str, model: str = DEFAULT_MODEL) -> tuple[bool, str]:
@@ -610,6 +954,7 @@ def recognize_hand(
                     "temperature": 0,
                 },
                 timeout=240,
+                effort=_stream_effort(m),
             )
         except AIError as exc:
             last_err = str(exc)
@@ -648,65 +993,76 @@ def recognize_hand(
     return None, last_err or "所有視覺模型都失敗，請稍後再試。"
 
 
-def build_analysis_prompt(hand: str, ctx: dict, facts: str = "") -> str:
-    """組裝牌局分析提示詞。"""
-    alerts = []
-    if ctx.get("riichi"):
-        alerts.append("有對手立直")
-    if ctx.get("meld"):
-        alerts.append("他家有副露（鳴牌）")
-    alert_text = "、".join(alerts) if alerts else "無特別警報"
+def build_analysis_prompt(
+    hand: str,
+    ctx: dict,
+    facts: str = "",
+    model_preds: str = "",
+    direction_hints: str = "無",
+) -> str:
+    """組裝牌局分析提示詞（Part 1：模型主導＋役種方向）。"""
+    riichi_alert = "有" if ctx.get("riichi") else "冇"
+    dora_text = ctx.get("dora") or "無"
+    meld_count = int(ctx.get("meld_count", 0) or 0)
+    facts_text = (facts or "").strip() or "（未提供）"
+    hints_text = (direction_hints or "").strip() or "無"
 
-    n = tr.count_tiles(hand)
-    discard_hint = (
-        "手牌 14 張，請明確指出應該打邊張。"
-        if n == 14
-        else "手牌 13 張（或更少），請針對進張與路線給建議。"
-    )
+    if model_preds and model_preds.strip():
+        model_block = model_preds.strip()
+        model_note = ""
+    else:
+        model_block = "無（模型未載入）"
+        model_note = (
+            "\n（今次冇高手模型建議：首選改為跟牌理分析結果講，"
+            "並喺解說入面講明冇模型建議。）"
+        )
 
-    return f"""你係日本麻雀（立直麻雀）嘅職業雀士兼牌局分析師。請用繁體中文（香港用語）分析以下局面。
+    return f"""你係日本麻雀解說員。你嘅工作唔係自己決定打邊隻牌，而係將
+「高手模型嘅建議」同「牌理分析嘅數字」用廣東話解釋俾用家聽。
 
-【局面資料】
-- 場風：{ctx.get("bakaze", "東")}場
-- 自風：{ctx.get("jikaze", "東")}家
-- 巡目：第 {ctx.get("junme", 1)} 巡
-- 寶牌：{ctx.get("dora") or "未指定"}
-- 警報：{alert_text}
-- 手牌（{n} 張）：{hand}
 
-{discard_hint}
+手牌：{hand}
+局勢：場風 {ctx.get("bakaze", "東")}、自風 {ctx.get("jikaze", "東")}、第 {ctx.get("junme", 1)} 巡、寶牌指示 {dora_text}、
+副露 {meld_count} 組、他家立直：{riichi_alert}
+牌理分析結果：{facts_text}
+（向聽數、進張、聽牌、已確定役牌、和牌預覽 — 一律以呢度為準）
+高手模型建議（按概率排）：{model_block}{model_note}
+潛在方向提示：{hints_text}
+（例如三元牌進度、染手傾向、對子數；冇就填「無」）
 
-{facts}
 
-【重要規則】
-- 以上「精算結果」係由麻雀計算引擎精確算出，**你必須以此為準**。
-- 唔可以否定或修改精算嘅向聽數、有效牌、役種、翻數、符數。
-- 你嘅價值在於解釋「點解」同提供策略，而唔係重新計算。
-- 如果精算結果同你嘅直覺有衝突，一律以精算結果為準。
+1. 以模型第一位做首選，解釋點解打佢：孤張、進張闊窄、寶牌、
+安全度 — 要對住實際手牌講，唔好空泛。
+2. 簡述次選係咩情況下嘅合理選擇。
+3. 講明潛在役種方向：只可以講「潛在方向提示」有列出嘅方向，同埋指出要保留嘅
+關鍵牌。如果提示係「無明顯役種方向」，最多用一句總括（例如「暫時無明顯役種方向」），
+唔准逐個點名排除冇出現嘅役種（例如「無三元牌、做唔到七對子、混一色唔使諗」）。
+如果提示有部分材料但未成形，可以一句帶過（例如「三元牌得一對，唔值得特登追」）。
+4. 局勢有風險（例如他家立直）先提防守注意；冇就唔使講。
 
-【分析要求】
-1. 評估牌型強度、和牌可能性
-2. 解釋精算建議嘅切牌理由（若已聽牌，說明待牌）
-3. 說明進張方向對牌型的意義
-4. 評估危險度，特別注意立直他家與副露家
-5. 役種：只可引用精算結果；冇提供就寫「未確定」
-6. 給出今後 2～3 巡的策略建議
 
-【輸出格式】用 Markdown，依序使用以下標題：
-### 🧠 整體評估
-### 🎯 切牌建議
-### ⚠️ 危險度分析
-### 🏆 役種
-### 💡 進一步建議
+- 唔可以改動牌理數字（向聽、番數、點數、進張），唔可以自己另計。
+- 解說入面提到向聽／進張嗰套數字嗰陣，一律叫「牌理分析」，唔准用「精算」呢個詞。
+- 唔可以推翻模型首選、另推一隻做第一建議；有唔同意見只可以
+寫成「補充睇法」並講明分別。
+- 唔可以將有組合關係嘅牌當孤張處理（例如三元牌嘅刻子／對子
+夥伴、順子邊張）。
+- 唔肯定嘅嘢要講明唔肯定，唔好作數據。
+- 如果「牌理分析結果」顯示已經聽牌（有待牌），或者事實列明切完即聽：
+  🎯 首選段最後必須加一句「立直判斷：立直／默聽＋理由」。
+- 事實入面有立直率就一定要引用嗰個數字（例如「高手喺呢種等牌有約 71% 會即刻立直」），
+  再結合巡目（13 巡起屬晚巡）同有冇役（有役／無役修飾）俾明確取向；
+  冇立直率就唔准自己作百分比。
+- 唔係聽牌局面就唔准出「立直判斷」。
+- 役種名一律用中文：平和（唔准寫 Pinfu）、斷么九（唔好寫 Tanyao）、混一色、
+  七對子、一氣通貫、三色同順、小三元、大三元、役牌；唔准用任何羅馬拼音役名。
 
-【嚴格禁止】
-- 唔准自行計算翻數、符數或點數。只有「精算結果」有提供嘅數字才可以引用。
-- 如果精算結果**沒有**提供役種／和牌預覽，即代表手牌未聽牌或役種未確定。
-  此時「🏆 役種」一節只可以寫：「役種未確定，待聽牌後由精算引擎確認」，
-  唔准自行列舉平和、一盃口、三色、斷么等役種。
-- 唔准講「已經立直」，除非精算結果顯示已和牌。
 
-請具體、精簡，避免空泛嘅一般性建議。"""
+繁體中文、廣東話口語（自然，唔好太俗）；術語用標準名。
+總長 250–350 字，固定三段：
+🎯 首選：…
+🔀 次選與方向：…
+⚠️ 注意：…（冇風險就成段省略）"""
 
 
 def analyze_hand(
@@ -716,6 +1072,8 @@ def analyze_hand(
     api_key: str = "",
     model: str = DEFAULT_MODEL,
     facts: str = "",
+    model_preds: str = "",
+    direction_hints: str = "無",
     fallback_models: list[str] | None = None,
 ) -> tuple[str | None, str]:
     """分析牌局。
@@ -723,8 +1081,11 @@ def analyze_hand(
     Args:
         backend: "openrouter" 或 "ollama"
         facts: 本地精算結果（Markdown），會加入提示詞並要求模型遵從。
+        model_preds: 高手出牌模型嘅頭 5 個建議（純文字），作為解說主軸。
+            傳空字串就同以前一樣，只按精算結果分析。
+        direction_hints: 潛在役種方向提示（純文字），冇就傳「無」。
     """
-    prompt = build_analysis_prompt(hand, ctx, facts)
+    prompt = build_analysis_prompt(hand, ctx, facts, model_preds, direction_hints)
 
     if backend == "ollama":
         return _analyze_ollama(prompt)
@@ -735,6 +1096,7 @@ def analyze_hand(
             candidates.append(alt)
 
     last_err = ""
+    primary_err = ""  # 主模型失敗原因（用嚟話俾用戶知點解轉咗 model）
     for m in candidates:
         try:
             data = _post_smart(
@@ -747,9 +1109,12 @@ def analyze_hand(
                     "temperature": 0.3,
                 },
                 timeout=300,
+                effort=_stream_effort(m),
             )
         except AIError as exc:
             last_err = str(exc)
+            if m == candidates[0] and not primary_err:
+                primary_err = last_err
             continue
 
         text = _message_text(data)
@@ -758,6 +1123,8 @@ def analyze_hand(
 
         if not text:
             last_err = _empty_reason(data)
+            if m == candidates[0] and not primary_err:
+                primary_err = last_err
             continue
 
         try:
@@ -766,7 +1133,14 @@ def analyze_hand(
             finish = ""
         if finish == "length":
             suffix += "，⚠️ 輸出被 token 上限截斷"
-        return text, f"分析完成（{m}{suffix}）"
+
+        note = f"分析完成（{m}{suffix}）"
+        if m != candidates[0] and primary_err:
+            note += (
+                f"　⚠️ 主模型 {candidates[0]} 暫時不可用"
+                f"（{_short_reason(primary_err)}），已自動轉用備援。"
+            )
+        return text, note
 
     return None, last_err or "分析失敗，請稍後再試。"
 

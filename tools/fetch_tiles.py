@@ -22,8 +22,9 @@ MAN = [f"Man{i}" for i in range(1, 10)]
 PIN = [f"Pin{i}" for i in range(1, 10)]
 SOU = [f"Sou{i}" for i in range(1, 10)]
 HONORS = ["Ton", "Nan", "Shaa", "Pei", "Haku", "Hatsu", "Chun"]
+RED_FIVES = ["Man5-Dora", "Pin5-Dora", "Sou5-Dora"]
 
-NAMES = MAN + PIN + SOU + HONORS
+NAMES = MAN + PIN + SOU + HONORS + RED_FIVES
 
 
 def main() -> None:

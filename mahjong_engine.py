@@ -78,6 +78,79 @@ def _ukeire(tiles34: list[int], shanten: int) -> list[tuple[int, int]]:
     return result
 
 
+# 役名中文對照（mahjong 套件本身用羅馬字，牌理卡只出中文）
+YAKU_NAMES_ZH = {
+    "Aka Dora": "赤寶牌",
+    "Chankan": "搶槓",
+    "Chantai": "混全帶",
+    "Chiihou": "地和",
+    "Chiitoitsu": "七對子",
+    "Chinitsu": "清一色",
+    "Chinroutou": "清老頭",
+    "Chuuren Poutou": "九蓮寶燈",
+    "Daburu Chuuren Poutou": "九蓮寶燈（二倍役滿）",
+    "Dai Suushii": "大四喜",
+    "Daichisei": "大七星",
+    "Daisangen": "大三元",
+    "Daisharin": "大車輪",
+    "Dora": "寶牌",
+    "Double Open Riichi": "雙重開立直",
+    "Double Riichi": "雙立直",
+    "Haitei Raoyue": "海底摸月",
+    "Honitsu": "混一色",
+    "Honroutou": "混老頭",
+    "Houtei Raoyui": "河底撈魚",
+    "Iipeiko": "一盃口",
+    "Ippatsu": "一發",
+    "Ittsu": "一氣通貫",
+    "Junchan": "純全帶",
+    "Kokushi Musou": "國士無雙",
+    "Kokushi Musou Juusanmen Matchi": "國士無雙十三面",
+    "Menzen Tsumo": "門前清自摸和",
+    "Nagashi Mangan": "流局滿貫",
+    "Open Riichi": "開立直",
+    "Paarenchan": "八連莊",
+    "Pinfu": "平和",
+    "Renhou": "人和",
+    "Renhou (yakuman)": "人和（役滿）",
+    "Riichi": "立直",
+    "Rinshan Kaihou": "嶺上開花",
+    "Ryanpeikou": "二盃口",
+    "Ryuuiisou": "綠一色",
+    "San Ankou": "三暗刻",
+    "San Kantsu": "三槓子",
+    "Sanshoku Doujun": "三色同順",
+    "Sanshoku Doukou": "三色同刻",
+    "Sashikomi": "差込",
+    "Shou Sangen": "小三元",
+    "Shousuushii": "小四喜",
+    "Suu Ankou": "四暗刻",
+    "Suu Ankou Tanki": "四暗刻單騎",
+    "Suu Kantsu": "四槓子",
+    "Tanyao": "斷么九",
+    "Tenhou": "天和",
+    "Toitoi": "對對和",
+    "Tsuu Iisou": "字一色",
+    "Ura Dora": "裏寶牌",
+    "Yakuhai (chun)": "役牌（中）",
+    "Yakuhai": "役牌",
+    "Yakuhai (haku)": "役牌（白）",
+    "Yakuhai (hatsu)": "役牌（發）",
+    "Yakuhai (round wind east)": "役牌（場風 東）",
+    "Yakuhai (round wind south)": "役牌（場風 南）",
+    "Yakuhai (round wind west)": "役牌（場風 西）",
+    "Yakuhai (round wind north)": "役牌（場風 北）",
+    "Yakuhai (seat wind east)": "役牌（自風 東）",
+    "Yakuhai (seat wind south)": "役牌（自風 南）",
+    "Yakuhai (seat wind west)": "役牌（自風 西）",
+    "Yakuhai (seat wind north)": "役牌（自風 北）",
+}
+
+
+def yaku_name_zh(name: str) -> str:
+    return YAKU_NAMES_ZH.get(name, name)
+
+
 def _hand_value(
     hand14: str,
     win_tile_label: str,
@@ -105,7 +178,7 @@ def _hand_value(
         if res.error:
             return None
         return {
-            "yaku": [y.name for y in (res.yaku or [])],
+            "yaku": [yaku_name_zh(y.name) for y in (res.yaku or [])],
             "han": res.han,
             "fu": res.fu,
             "cost": res.cost,

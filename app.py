@@ -1,19 +1,27 @@
 import hashlib
 import io
 import os
+import re
 
+import requests
 import streamlit as st
 from PIL import Image
 
 import ai_client as ai
 import mahjong_engine as me
+import ml_predict as mlp
 import tile_images as ti
 import tile_recognizer as tr
+import yaku_catalog as yc
+import yaku_hints as yh
 
 # OpenRouter 模型（實測後嘅建議）
 # 註：minimax-m3.1-flash:free 免費期已於 2026-10-22 結束；Gemini 喺香港被地區封鎖。
 DEFAULT_VISION_MODEL = "meta/muse-spark-1.3-contributor"
-DEFAULT_ANALYSIS_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+DEFAULT_ANALYSIS_MODEL = "meta/muse-spark-1.3-contributor"
+
+HONOR_LABELS = {"1z": "東", "2z": "南", "3z": "西", "4z": "北", "5z": "白", "6z": "發", "7z": "中"}
+SUIT_LABELS = {"m": "萬", "p": "筒", "s": "索"}
 
 
 def get_secret(*names: str, default: str = "") -> str:
@@ -31,10 +39,145 @@ def get_secret(*names: str, default: str = "") -> str:
     return default
 
 
-# 辨識結果快取 —— 只快取「成功」嘅結果。
-# 之前用 st.cache_data 會連失敗都一齊快取，令「token 用盡」嘅錯誤永久定型，
-# 點解重試都係同一個錯。改用自己嘅 dict，只存成功結果。
-_RECOGNIZE_CACHE: dict[str, tuple[str, str]] = {}
+# ── 手牌代碼解析 ─────────────────────────────────────────────
+_ALLOWED_CHARS = set("0123456789mpszr")
+
+
+def scan_tiles(text: str) -> tuple[list[str] | None, str]:
+    """只做語法檢查（唔檢查總數），回傳 (tiles, error)。
+
+    支援連寫（123m）、空格、逗號；`r` 後綴＝赤五（5mr／5pr／5sr）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, "請先輸入手牌。"
+
+    cleaned = re.sub(r"[\s,，、;；]+", "", raw)
+    bad = sorted({ch for ch in cleaned if ch not in _ALLOWED_CHARS})
+    if bad:
+        return None, f"有唔識嘅字元：{''.join(bad)}。請用數字＋花色（m／p／s／z）。"
+
+    tiles: list[str] = []
+    i = 0
+    n = len(cleaned)
+    while i < n:
+        if not cleaned[i].isdigit():
+            return None, f"「{cleaned[i]}」前面要有一個數字，例如 5m。"
+        j = i
+        while j < n and cleaned[j].isdigit():
+            j += 1
+        if j >= n or cleaned[j] not in "mpsz":
+            return None, "每組數字後面要跟花色 m／p／s／z。"
+        digits = cleaned[i:j]
+        suit = cleaned[j]
+        i = j + 1
+
+        red = i < n and cleaned[i] == "r"
+        if red:
+            if digits[-1] != "5" or suit == "z":
+                return None, "赤五只可以寫 5mr／5pr／5sr。"
+            i += 1
+
+        for pos, ch in enumerate(digits):
+            d = int(ch)
+            if suit == "z":
+                if not 1 <= d <= 7:
+                    return None, "字牌只可以係 1z–7z（東南西北白發中）。"
+                tiles.append(f"{d}z")
+            else:
+                if d == 0 or (red and pos == len(digits) - 1):
+                    tiles.append(f"5{suit}r")
+                else:
+                    tiles.append(f"{d}{suit}")
+
+    counts: dict[str, int] = {}
+    for tile in tiles:
+        base = tile[:-1] if tile.endswith("r") else tile
+        counts[base] = counts.get(base, 0) + 1
+    over = [b for b, c in counts.items() if c > 4]
+    if over:
+        return None, f"{'、'.join(over)} 超過 4 隻。"
+
+    return tiles, ""
+
+
+def parse_hand_codes(
+    text: str,
+    meld_count: int = 0,
+    meld_total: int | None = None,
+    meld_codes: list[str] | None = None,
+) -> tuple[list[str] | None, str]:
+    """手牌隻數＋副露總隻數必須係 13 或 14；每種牌合共唔可以過 4。"""
+    tiles, err = scan_tiles(text)
+    if tiles is None:
+        return None, err
+    meld_total = (
+        len(meld_codes) if meld_codes is not None
+        else (int(meld_total) if meld_total is not None else 3 * int(meld_count))
+    )
+    total = len(tiles) + meld_total
+    if total not in (13, 14):
+        return None, (
+            f"手牌 {len(tiles)} 隻 ＋ 副露 {meld_total} 隻 ＝ {total} 隻，"
+            "應該要係 13 或 14 隻。"
+        )
+    counts: dict[str, int] = {}
+    for tile in list(tiles) + list(meld_codes or []):
+        base = tile[:-1] if tile.endswith("r") else tile
+        counts[base] = counts.get(base, 0) + 1
+    over = [b for b, c in counts.items() if c > 4]
+    if over:
+        return None, f"{'、'.join(over)} 合共超過 4 隻（手牌＋副露）。"
+    return tiles, ""
+
+
+def hand_to_plain(tiles: list[str]) -> str:
+    """tiles（可含 r）→ 精算引擎用嘅標準手牌字串（r 當普通 5）。"""
+    return tr.normalize_hand("".join(t[:-1] if t.endswith("r") else t for t in tiles))
+
+
+def tile_label(tile: str) -> str:
+    """'9p' → '9筒'；'5mr' → '赤5萬'；'3z' → '西'。"""
+    if not tile:
+        return ""
+    red = tile.endswith("r")
+    base = tile[:-1] if red else tile
+    if base.endswith("z"):
+        name = HONOR_LABELS.get(base, base)
+        return f"赤{name}" if red else name
+    prefix = "赤" if red else ""
+    return f"{prefix}{base[0]}{SUIT_LABELS.get(base[1], base[1])}"
+
+
+def display_tile(tile: str, tiles: list[str]) -> str:
+    """如果手牌只有赤五、冇普通五，該類型顯示用赤五圖。"""
+    if tile in ("5m", "5p", "5s"):
+        red = tile + "r"
+        if red in tiles and tile not in tiles:
+            return red
+    return tile
+
+
+def set_hand(
+    tiles: list[str],
+    source: str,
+    recognized: bool = False,
+    drawn: str | None = None,
+    meld_tiles: list[list[str]] | None = None,
+) -> None:
+    st.session_state["hand_tiles"] = list(tiles)
+    st.session_state["hand_drawn"] = drawn
+    st.session_state["meld_tiles"] = [list(g) for g in (meld_tiles or [])]
+    st.session_state["meld_count_pending"] = len(meld_tiles or [])
+    st.session_state["hand_source"] = source
+    st.session_state.pop("hand_error", None)
+    # 手牌一改，舊 AI 解說即刻作廢
+    st.session_state.pop("analysis", None)
+    st.session_state["recognized_notice"] = bool(recognized)
+
+
+# ── 辨識結果快取 —— 只快取「成功」嘅結果。─────────────────────
+_RECOGNIZE_CACHE: dict[str, tuple[str, str, str | None, list | None]] = {}
 
 
 def _recognize_now(
@@ -46,6 +189,7 @@ def _recognize_now(
     bottom_pct: int = 100,
     per_tile: bool = True,
     local_first: bool = False,
+    status: dict | None = None,
 ) -> tuple[str | None, str]:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image = tr.crop_hand_region(image, bottom_pct)
@@ -57,14 +201,47 @@ def _recognize_now(
         return tr.recognize(image, engine="template")
 
     if provider == "openrouter":
-        # 先試自動切牌 + 逐張辨識（準確度明顯較高）
         if per_tile:
+            layout = tr.split_hand_layout(image)
+            if layout:
+                hand_codes, hmsg = ai.recognize_boxes(
+                    image, api_key, layout["hand"], vision_model,
+                )
+                meld_codes, mmsg = ai.recognize_boxes(
+                    image, api_key, layout["meld"], vision_model,
+                )
+                if hand_codes and meld_codes:
+                    status = status if status is not None else {}
+                    groups = ai.group_meld_tiles(meld_codes)
+                    status["meld_tiles"] = groups
+                    status["meld_count"] = len(groups)
+                    status["drawn"] = None
+                    hand = " ".join(ai._sorted_hand_tokens(hand_codes))
+                    note = (
+                        f"逐張辨識完成（手牌 {len(hand_codes)} 隻 + 副露 {len(meld_codes)} 隻）："
+                        f"{hmsg}　副露：{mmsg}"
+                    )
+                    if any(len(g) not in (3, 4) for g in groups):
+                        note += "\n⚠️ 副露分組唔勻（剩 1–2 隻），請逐隻核對。"
+                    if len(hand_codes) + len(meld_codes) not in (13, 14):
+                        note += (
+                            f"\n⚠️ 手牌＋副露共 {len(hand_codes) + len(meld_codes)} 隻，"
+                            "正常應為 13 或 14，請核對。"
+                        )
+                    return hand, note
+
             boxes = tr.split_hand_tiles(image)
             if boxes:
                 return ai.recognize_hand_per_tile(
-                    image, api_key, boxes, vision_model, local_first=local_first
+                    image, api_key, boxes, vision_model,
+                    local_first=local_first, status=status,
                 )
-        # 切唔到（實體牌相片／完整截圖）→ 用整條辨識
+            # 切唔到牌 → 用成副辨識，但一定要話俾用戶知準確度較低
+            hand, msg = ai.recognize_hand(image, api_key=api_key, model=vision_model)
+            warn = (
+                "⚠️ 切牌失敗，今次用咗成副辨識，準確度較低，請逐隻核對牌面。"
+            )
+            return hand, (f"{msg}\n{warn}" if hand else f"{warn}\n{msg}")
         return ai.recognize_hand(image, api_key=api_key, model=vision_model)
 
     return tr.recognize(image, engine="ollama")
@@ -80,11 +257,9 @@ def cached_recognize(
     bottom_pct: int = 100,
     per_tile: bool = True,
     local_first: bool = False,
+    status: dict | None = None,
 ) -> tuple[str | None, str]:
-    """辨識結果快取 —— 避免 Streamlit rerun 時重複跑（本機模型很耗 CPU）。
-
-    失敗唔會入快取，所以上游一恢復就即刻可以重試。
-    """
+    """辨識結果快取 —— 失敗唔會入快取，上游恢復就可以即刻重試。"""
     sig = hashlib.md5(
         b"|".join(
             [
@@ -101,27 +276,168 @@ def cached_recognize(
     ).hexdigest()
 
     if not force and sig in _RECOGNIZE_CACHE:
-        return _RECOGNIZE_CACHE[sig]
+        hand, msg, drawn, melds = _RECOGNIZE_CACHE[sig]
+        if status is not None:
+            status["drawn"] = drawn
+            status["meld_tiles"] = melds or []
+        return hand, msg
 
     hand, msg = _recognize_now(
         image_bytes, engine, provider, api_key, vision_model,
-        bottom_pct, per_tile, local_first,
+        bottom_pct, per_tile, local_first, status=status,
     )
     if hand:
-        _RECOGNIZE_CACHE[sig] = (hand, msg)
+        _RECOGNIZE_CACHE[sig] = (hand, msg, (status or {}).get("drawn"), (status or {}).get("meld_tiles"))
     return hand, msg
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def local_statuses() -> dict:
-    """本機引擎可用狀態（快取 30 秒，避免每次 rerun 都探測 Ollama）。"""
     return tr.engines()
 
 
 @st.cache_data(show_spinner=False, max_entries=50)
 def cached_calc(hand: str, bakaze: str, jikaze: str, dora: str) -> dict:
-    """精算結果快取（純本地計算，瞬間完成）。"""
     return me.analyze(hand, {"bakaze": bakaze, "jikaze": jikaze, "dora": dora})
+
+
+# 高手立直率（來源：天鳳 1194 場高手牌局、首次聽牌點統計）
+RICHI_BASE_RATE = 61.4
+RICHI_LATE_RATE = 42.8
+RICHI_YAKU_RATE = 52.5
+RICHI_NO_YAKU_RATE = 74.9
+
+
+def _riichi_reference(
+    hand_tiles: list[str],
+    discard_tile: str,
+    junme: int,
+    meld_count: int,
+    bakaze: str,
+    jikaze: str,
+    dora_text: str,
+) -> dict | None:
+    """門清、模型首選切完即聽 → 回傳同類等牌嘅高手立直率。"""
+    if (
+        not hand_tiles
+        or not discard_tile
+        or int(meld_count) != 0
+        or len(hand_tiles) != 14
+    ):
+        return None
+
+    base = discard_tile[:-1] if discard_tile.endswith("r") else discard_tile
+    remain: list[str] = []
+    removed = False
+    for tile in hand_tiles:
+        tb = tile[:-1] if tile.endswith("r") else tile
+        if not removed and tb == base:
+            removed = True
+            continue
+        remain.append(tb)
+    if not removed:
+        return None
+
+    hand13 = tr.normalize_hand("".join(remain))
+    calc13 = cached_calc(hand13, bakaze, jikaze, dora_text.strip())
+    if calc13.get("error") or calc13.get("shanten") != 0:
+        return None
+
+    waits = calc13.get("waits") or []
+    kinds = len(waits)
+    if kinds == 0:
+        return None
+
+    # 剩餘張數：引擎只扣自己手牌；再扣寶牌指示牌（冇牌河資料，屬上限估計）
+    indicator_counts: dict[str, int] = {}
+    if dora_text.strip():
+        for tile in ti.expand_hand(tr.normalize_hand(dora_text)):
+            tb = tile[:-1] if tile.endswith("r") else tile
+            indicator_counts[tb] = indicator_counts.get(tb, 0) + 1
+    remaining = sum(
+        max(0, count - indicator_counts.get(wait, 0)) for wait, count in waits
+    )
+    if remaining <= 0:
+        return None
+
+    if kinds == 1:
+        rate, bucket = 49.0, "1 種等"
+    elif kinds == 2:
+        if remaining <= 4:
+            rate, bucket = 57.9, "2 種等，剩 1–4 張"
+        else:
+            rate, bucket = 71.2, "2 種等，剩 5–8 張"
+    else:
+        if remaining <= 4:
+            rate, bucket = 76.6, "3+ 種等，剩 1–4 張"
+        else:
+            rate, bucket = 78.2, "3+ 種等，剩 5 張以上"
+
+    preview = calc13.get("agari_preview") or []
+    has_yaku = any(v.get("yaku") for v in preview)
+
+    return {
+        "rate": rate,
+        "bucket": bucket,
+        "kinds": kinds,
+        "remaining": remaining,
+        "waits": waits,
+        "has_yaku": has_yaku,
+        "junme": int(junme),
+    }
+
+
+def _base_tile(tile: str) -> str:
+    return tile[:-1] if tile.endswith("r") else tile
+
+
+def _meld_facts(meld_tiles: list[list[str]]) -> str:
+    """副露事實行，例如「副露：碰五索（5sr 5s 5s）」。"""
+    if not meld_tiles:
+        return ""
+    parts = []
+    for group in meld_tiles:
+        if not group:
+            continue
+        codes = " ".join(group)
+        bases = [_base_tile(t) for t in group]
+        if len(group) == 4 and len(set(bases)) == 1:
+            call = "槓"
+            name = tile_label(bases[0])
+        elif len(group) >= 3 and len(set(bases)) == 1:
+            call = "碰"
+            name = tile_label(bases[0])
+        else:
+            call = "吃"
+            name = "、".join(tile_label(t) for t in group)
+        parts.append(f"{call}{name}（{codes}）")
+    return "\n副露：" + "；".join(parts) if parts else ""
+
+
+def _riichi_facts(ref: dict) -> str:
+    return (
+        "\n【立直率參考】（天鳳 1194 場高手牌局・首次聽牌點統計；"
+        "冇牌河資料，剩餘張數係上限估計）\n"
+        f"- 同類等牌（{ref['bucket']}，剩約 {ref['remaining']} 張）：{ref['rate']:.1f}%\n"
+        f"- 整體基準：{RICHI_BASE_RATE:.1f}%；晚巡（13 巡起）約 {RICHI_LATE_RATE:.1f}%；"
+        f"有役約 {RICHI_YAKU_RATE:.1f}%；無役約 {RICHI_NO_YAKU_RATE:.1f}%\n"
+        f"- 呢手聽牌有役：{'是' if ref['has_yaku'] else '否'}"
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def openrouter_connected(key: str) -> bool:
+    if not key:
+        return False
+    try:
+        r = requests.get(
+            f"{ai.BASE_URL}/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=6,
+        )
+        return r.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ── 頁面設定 ────────────────────────────────────────────────
@@ -134,73 +450,151 @@ st.set_page_config(
 
 st.markdown(
     """
-    <div style="text-align: center; padding-bottom: 1rem;">
-        <h1>🀄 日本麻雀 AI 牌局分析助手</h1>
-        <p style="font-size: 1.1rem; color: #666;">
-            輸入手牌或上傳雀魂／天鳳截圖，讓 AI 協助深度分析牌局局勢
-        </p>
-    </div>
-    """,
+<style>
+:root{
+  --felt:#0d130f; --panel:#141d16; --panel2:#18241b; --line:#26362a;
+  --gold:#d4af37; --gold2:#9a7f2a; --text:#e9e6da; --muted:#9db3a2;
+  --danger:#d64545; --green:#2e7d4f; --green-bright:#41b06c;
+  --tile:#f7f2df; --tile-edge:#cfc7a8;
+}
+.stApp{
+  background:
+    radial-gradient(1200px 600px at 50% -100px, #1a2b1e, var(--felt));
+  color:var(--text);
+}
+[data-testid="stSidebar"]{
+  background:var(--panel);
+  border-right:1px solid var(--line);
+}
+h1,h2,h3,h4,h5{color:var(--text) !important; letter-spacing:.2px;}
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stWidgetLabel"] p, label{color:var(--text);}
+[data-testid="stCaptionContainer"], small{color:var(--muted) !important;}
+hr{border-color:var(--line);}
+div[data-testid="stVerticalBlock"][class*="st-key-"]{
+  background:var(--panel);
+  border-color:var(--line);
+}
+.stButton>button{
+  background:var(--panel2);
+  color:var(--text); border:1px solid var(--line);
+  border-radius:10px; font-weight:600;
+}
+.stButton>button:hover{border-color:var(--gold); color:var(--text); background:var(--panel2);}
+.stButton>button[kind="primary"]{
+  background:var(--gold); color:#1a1405; border:none;
+}
+.stButton>button[kind="primary"]:hover{background:var(--gold); color:#1a1405;}
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea{
+  background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:10px;
+}
+button[data-baseweb="tab"]{color:var(--muted);}
+button[data-baseweb="tab"][aria-selected="true"]{color:var(--gold);}
+[data-testid="stExpander"] details{
+  background:var(--panel); border:1px solid var(--line); border-radius:12px;
+}
+/* header */
+.mj-header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:6px;}
+.mj-brand{display:flex;align-items:center;gap:12px;}
+.mj-logo{font-size:34px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4));}
+.mj-title{font-size:1.55rem;font-weight:800;color:var(--text);line-height:1.15;margin:0;}
+.mj-sub{font-size:.85rem;color:var(--muted);margin:2px 0 0;}
+.mj-status{display:flex;gap:8px;flex-wrap:wrap;}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
+  font-size:.78rem;border:1px solid var(--line);background:var(--panel2);color:var(--muted);}
+.chip.ok{border-color:var(--green);color:var(--green-bright);}
+.chip.bad{border-color:var(--danger);color:var(--danger);}
+/* steps */
+.mj-steps{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 14px;color:var(--muted);font-size:.85rem;}
+.mj-steps .step{padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--panel2);}
+.mj-steps .step.active{border-color:var(--gold);color:var(--text);}
+/* mobile summary */
+.mj-mobile-summary{display:none;font-size:.82rem;color:var(--gold);
+  border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin-bottom:10px;
+  background:var(--panel2);}
+@media (max-width: 640px){
+  .mj-mobile-summary{display:block;}
+  .mj-title{font-size:1.2rem;}
+  .mj-header{gap:8px;}
+}
+/* hero */
+.st-key-hero_card{
+  border:2px solid var(--gold2) !important; border-radius:20px !important;
+  box-shadow:0 0 26px rgba(212,175,55,.14);
+  background:linear-gradient(135deg,#1c2a1a,var(--panel) 60%) !important;
+}
+.hero-name{font-size:1.5rem;font-weight:800;color:var(--text);margin:0;}
+.hero-pct{font-size:2.6rem;font-weight:800;color:var(--gold);line-height:1.05;margin:2px 0 6px;}
+.hero-chip{display:inline-block;padding:4px 11px;border-radius:999px;font-size:.8rem;
+  border:1px solid var(--green);color:var(--green-bright);background:var(--panel2);}
+/* skeleton */
+.sk-line{height:14px;border-radius:7px;background:var(--line);margin:9px 0;}
+.sk-line.w90{width:90%;} .sk-line.w70{width:70%;} .sk-line.w50{width:50%;}
+/* tile buttons */
+[class*="st-key-tilebtn_"] button{height:74px;min-width:46px;width:100%;padding:0 !important;
+  background-size:contain;background-repeat:no-repeat;background-position:center;
+  background-color:var(--tile);border:1px solid var(--tile-edge);
+  border-radius:9px;position:relative;}
+[class*="st-key-tilebtn_"] button p{display:none;}
+[class*="st-key-tilebtn_"] button:hover{box-shadow:0 0 0 2px var(--gold);}
+[class*="st-key-tilebtn_"] button:hover::after{content:"✎";position:absolute;top:-6px;right:-5px;
+  background:var(--gold);color:#1a1405;border-radius:50%;width:18px;height:18px;
+  font-size:11px;line-height:18px;text-align:center;font-weight:700;}
+/* hand row: 14 tiles always one line */
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) {
+  flex-wrap:nowrap !important;
+  gap:4px !important;
+  align-items:flex-end;
+  overflow:visible;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [class*="st-key-tilebtn_"] {
+  flex:1 1 0 !important;
+  min-width:0 !important;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stLayoutWrapper"] {
+  flex:1 1 0 !important;
+  min-width:0 !important;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stElementContainer"]:not([class*="st-key-tilebtn_"]) {
+  flex:0 0 16px !important;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) [class*="st-key-tilebtn_"] button {
+  min-width:0 !important;
+  width:100% !important;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stLayoutWrapper"] [data-testid="stElementContainer"] {
+  width:100% !important;
+  min-width:0 !important;
+}
+/* hand card columns: give the tile row the width, keep meld area fixed */
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]) > [data-testid="stColumn"]:first-child {
+  flex:1 1 auto !important;
+  min-width:0 !important;
+}
+[class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]) > [data-testid="stColumn"]:last-child {
+  flex:0 0 150px !important;
+  min-width:130px !important;
+}
+.draw-label{font-size:.7rem;color:var(--gold);text-align:center;margin-bottom:2px;}
+[class*="st-key-meldbtn_"] button{height:56px;min-width:28px;width:100%;padding:0 !important;
+  background-size:contain;background-repeat:no-repeat;background-position:center;
+  background-color:var(--tile);border:1px solid var(--tile-edge);border-radius:7px;}
+[class*="st-key-meldbtn_"] button p{display:none;}
+[class*="st-key-meldbtn_"] button:hover{box-shadow:0 0 0 2px var(--gold);}
+.meld-box{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;
+  color:var(--muted);font-size:.8rem;min-height:74px;}
+.compact-row{display:flex;align-items:center;gap:8px;margin:5px 0;}
+.compact-bar{flex:1;height:6px;background:var(--line);border-radius:4px;overflow:hidden;}
+.compact-bar>div{height:100%;background:linear-gradient(90deg,var(--gold2),var(--gold));border-radius:4px;}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
 # ── 側邊欄 ──────────────────────────────────────────────────
 with st.sidebar:
-    st.header("🤖 AI 設定")
-
-    saved_key = get_secret("OPENROUTER_API_KEY")
-
-    provider_label = st.selectbox(
-        "AI 供應商",
-        ["OpenRouter（雲端・唔使開機）", "本機 Ollama（免費・私隱）"],
-        index=0 if saved_key else 1,
-        help="雲端模式需要網絡同 API key；本機模式需要開住電腦並安裝 Ollama",
-    )
-    provider = "openrouter" if provider_label.startswith("OpenRouter") else "ollama"
-
-    api_key = ""
-    vision_model = DEFAULT_VISION_MODEL
-    analysis_model = DEFAULT_ANALYSIS_MODEL
-
-    if provider == "openrouter":
-        api_key = st.text_input(
-            "OpenRouter API Key",
-            type="password",
-            value=saved_key,
-            placeholder="sk-or-v1-...",
-            help="唔會寫入程式碼；本機存於 .streamlit/secrets.toml（已被 gitignore）",
-        )
-
-        with st.expander("模型設定", expanded=False):
-            vision_model = st.text_input(
-                "手牌辨識模型（需要視覺能力）",
-                value=get_secret("OPENROUTER_VISION_MODEL", default=DEFAULT_VISION_MODEL),
-            )
-            analysis_model = st.text_input(
-                "牌局分析模型",
-                value=get_secret("OPENROUTER_ANALYSIS_MODEL", default=DEFAULT_ANALYSIS_MODEL),
-            )
-            st.caption(
-                "預設辨識用 `meta/muse-spark-1.3-contributor`（準、有視覺），"
-                "被封鎖時會自動轉用 `meta/muse-spark-open`。"
-                "分析用 `nvidia/nemotron-3-ultra-550b-a55b:free`（約 1–2 分鐘）。"
-            )
-
-        if st.button("🔌 測試連線", width="stretch"):
-            with st.spinner("測試中..."):
-                ok, msg = ai.check_key(api_key, vision_model)
-            (st.success if ok else st.error)(msg)
-
-        if not api_key:
-            st.warning("請輸入 OpenRouter API Key 先可以用雲端功能。")
-        elif analysis_model.endswith(":free"):
-            st.caption("💡 免費模型約需 1–2 分鐘；加 US$5 credit 可改用更快更準嘅付費模型。")
-    else:
-        ok, msg = local_statuses()["ollama"]
-        st.caption(("✅ " if ok else "⚠️ ") + msg)
-
-    st.divider()
-    st.header("⚙️ 局勢設定")
+    st.markdown("### 🎲 局勢設定")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -208,368 +602,962 @@ with st.sidebar:
     with col2:
         jikaze = st.selectbox("自風", ["東", "南", "西", "北"], index=0)
 
-    junme = st.slider(
-        "巡目",
-        min_value=1,
-        max_value=18,
-        value=1,
-        step=1,
-        help="目前牌局進行至第幾巡",
-    )
-
+    junme = st.slider("巡目", 1, 18, 1, 1, help="目前牌局進行至第幾巡")
     dora = st.text_input(
         "寶牌指示牌 (Dora)",
         placeholder="例如：3p、5s、東",
         help="輸入牌山翻開嘅指示牌（例如翻開 3p，即代表 4p 係寶牌）",
     )
+    if "meld_count_pending" in st.session_state:
+        st.session_state["meld_count_input"] = st.session_state.pop("meld_count_pending")
+    if "meld_count_input" not in st.session_state:
+        st.session_state["meld_count_input"] = 0
 
-    st.divider()
+    meld_count = st.number_input(
+        "已副露組數（鳴牌）",
+        min_value=0, max_value=4, step=1,
+        key="meld_count_input",
+        help="你已經鳴牌（食糊／碰／槓）嘅組數",
+    )
+
+    # 用戶人手改組數 → 清走已認到嘅副露牌，退返「得組數」模式
+    if st.session_state.get("meld_tiles") and int(meld_count) != len(st.session_state["meld_tiles"]):
+        st.session_state["meld_tiles"] = []
+
     st.markdown("**局勢警報**")
-    alert_riichi = st.checkbox("是否有對立直")
-    alert_meld = st.checkbox("他家副露等警報")
+    alert_riichi = st.checkbox("有對手立直")
+    alert_meld = st.checkbox("他家有副露")
 
-    st.divider()
-    st.markdown("**手牌辨識方式**")
-    engine_label = st.selectbox(
-        "辨識方式",
-        ["自動（有模板用模板，否則用 AI）", "AI 視覺辨識", "OpenCV 模板比對"],
-        index=0,
-        help="模板比對最快但要先建立 34 張模板；AI 視覺通用但較慢",
-    )
-    engine = {
-        "自動（有模板用模板，否則用 AI）": "auto",
-        "AI 視覺辨識": "ai",
-        "OpenCV 模板比對": "template",
-    }[engine_label]
-
-    tmpl_ok, tmpl_msg = tr.template_status()
-    if engine == "template":
-        st.caption(("✅ " if tmpl_ok else "⚠️ ") + tmpl_msg)
-    elif engine == "auto" and not tmpl_ok:
-        st.caption("ℹ️ 模板未齊全，會使用 AI 視覺辨識。")
-
-    per_tile = st.checkbox(
-        "🔍 先切牌逐張辨識（推薦）",
-        value=True,
-        help=(
-            "自動偵測手牌條上每張牌嘅邊界，然後逐張放大辨識。"
-            "實測準確度明顯高過「整條 14 張一齊睇」。"
-            "需要 AI 視覺辨識（唔適用於模板比對）。"
-            "注意：會用多啲 API 請求次數（每手牌約 10–14 次）。"
-        ),
-    )
-
-    local_first = st.checkbox(
-        "⚡ 省 API 模式（推薦）",
-        value=True,
-        disabled=not per_tile,
-        help=(
-            "本地形狀分析（數圓圈／數竹枝／認空白）夠肯定嘅牌，直接採用唔問 AI。"
-            "實測喺示範圖 18/18 全對，而且可以省 60% 以上請求次數、避開免費層限流。"
-            "剩低真正要 AI 判斷嘅（萬子漢數字、字牌、部分筒子）才會送去問。"
-        ),
-    )
-
-# ── 手牌輸入 ────────────────────────────────────────────────
-st.subheader("🎴 手牌輸入")
-tab_manual, tab_image, tab_camera = st.tabs(["手動輸入", "圖片上傳", "即時影相"])
-
-with tab_manual:
-    st.markdown("**請輸入你的手牌代碼**")
-    hand_text = st.text_area(
-        "手牌",
-        placeholder="範例：123m456p789s11z",
-        height=100,
-        help="支援格式：m=萬、p=筒、s=索、z=字",
-    )
-    st.caption("說明：m = 萬子、p = 筒子、s = 索子、z = 字牌（東南西北白發中）")
-
-with tab_image:
-    st.markdown("**上傳雀魂／天鳳截圖進行自動辨識**")
-    uploaded_image = st.file_uploader(
-        "選擇圖片檔案",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=False,
-        help="支援 PNG、JPG 格式的雀魂或天鳳遊戲截圖",
-    )
-
-    if uploaded_image is not None:
-        st.image(uploaded_image, caption="已上傳的截圖預覽", width="stretch")
-
-        bottom_pct = st.slider(
-            "🔍 只分析畫面底部百分比",
-            min_value=15,
-            max_value=100,
-            value=100,
-            step=5,
-            help=(
-                "雀魂／天鳳截圖入面手牌喺最底。調低呢個值會裁走上面嘅部分並放大，"
-                "令 AI 睇得更準（100 = 唔裁剪）。"
-            ),
-        )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            do_recognize = st.button(
-                "🔍 辨識手牌", key="btn_upload_ocr", width="stretch"
-            )
-        with col2:
-            do_force = st.button(
-                "🔄 重新辨識（略過快取）", key="btn_upload_ocr_force", width="stretch"
-            )
-
-        if do_recognize or do_force:
-            st.session_state.pop("upload_edit", None)
-            with st.spinner("辨識中..."):
-                hand, msg = cached_recognize(
-                    uploaded_image.getvalue(),
-                    engine,
-                    provider,
-                    api_key,
-                    vision_model,
-                    force=do_force,
-                    bottom_pct=bottom_pct,
-                    per_tile=per_tile,
-                    local_first=local_first,
-                )
-            st.session_state["upload_hand"] = hand or ""
-            st.session_state["upload_msg"] = msg
-
-        if st.session_state.get("upload_msg"):
-            if st.session_state.get("upload_hand"):
-                st.success(st.session_state["upload_msg"])
-            else:
-                st.warning(st.session_state["upload_msg"])
-
-        if st.session_state.get("upload_hand"):
-            st.session_state["upload_hand"] = st.text_input(
-                "辨識結果（可直接修改）",
-                value=st.session_state["upload_hand"],
-                key="upload_edit",
-                help="格式：123m456p789s11z",
-            )
-
-with tab_camera:
-    st.markdown("**即時影相辨識**")
-    st.caption(
-        "對準手牌按快門，影完會自動辨識。影相功能需要以 localhost 或 HTTPS 開啟頁面。"
-    )
-
-    camera_image = st.camera_input("對準手牌影相", key="camera_input")
-
-    if camera_image is not None:
-        st.image(camera_image, caption="擷取畫面", width="stretch")
-
-        data = camera_image.getvalue()
-        sig = hashlib.md5(data).hexdigest()
-        if st.session_state.get("camera_sig") != sig:
-            st.session_state["camera_sig"] = sig
-            st.session_state.pop("camera_edit", None)
-            with st.spinner("即時辨識中..."):
-                hand, msg = cached_recognize(
-                    data,
-                    engine,
-                    provider,
-                    api_key,
-                    vision_model,
-                    force=True,
-                    per_tile=per_tile,
-                    local_first=local_first,
-                )
-            st.session_state["camera_hand"] = hand or ""
-            st.session_state["camera_msg"] = msg
-
-        if st.button("🔄 重新辨識", key="btn_camera_retry"):
-            st.session_state.pop("camera_sig", None)
+    if st.button("✨ 載入範例手牌", width="stretch"):
+        sample, _err = scan_tiles("34m 4p 1234s 555667z 9p")
+        if sample:
+            set_hand(sample, "範例手牌")
             st.rerun()
 
-        if st.session_state.get("camera_msg"):
-            if st.session_state.get("camera_hand"):
-                st.success(st.session_state["camera_msg"])
-            else:
-                st.warning(st.session_state["camera_msg"])
+    if st.button("📖 役種一覽", width="stretch"):
+        st.session_state["yaku_open"] = True
+        st.rerun()
 
-        if st.session_state.get("camera_hand"):
-            st.session_state["camera_hand"] = st.text_input(
-                "辨識結果（可直接修改）",
-                value=st.session_state["camera_hand"],
-                key="camera_edit",
-                help="格式：123m456p789s11z",
+    st.divider()
+    with st.expander("⚙️ AI 設定", expanded=False):
+        saved_key = get_secret("OPENROUTER_API_KEY")
+
+        provider_label = st.selectbox(
+            "AI 供應商",
+            ["OpenRouter（雲端）", "本機 Ollama（免費・私隱）"],
+            index=0 if saved_key else 1,
+        )
+        provider = "openrouter" if provider_label.startswith("OpenRouter") else "ollama"
+
+        api_key = ""
+        vision_model = DEFAULT_VISION_MODEL
+        analysis_model = DEFAULT_ANALYSIS_MODEL
+
+        if provider == "openrouter":
+            api_key = st.text_input(
+                "OpenRouter API Key",
+                type="password",
+                value=saved_key,
+                placeholder="sk-or-v1-...",
             )
+            vision_model = st.text_input(
+                "手牌辨識模型",
+                value=get_secret("OPENROUTER_VISION_MODEL", default=DEFAULT_VISION_MODEL),
+            )
+            analysis_model = st.text_input(
+                "牌局分析模型",
+                value=get_secret("OPENROUTER_ANALYSIS_MODEL", default=DEFAULT_ANALYSIS_MODEL),
+            )
+            st.caption("辨識被封鎖時會自動轉用 `meta/muse-spark-open`。")
 
-    with st.expander("🔧 未偵測到本機辨識引擎？安裝方法"):
-        st.markdown(
-            """
-**方案 A：本機視覺模型（免費、圖片不外傳）**
+            if st.button("🔌 測試連線", width="stretch"):
+                with st.spinner("測試中..."):
+                    ok, msg = ai.check_key(api_key, vision_model)
+                (st.success if ok else st.error)(msg)
+        else:
+            ok, msg = local_statuses()["ollama"]
+            st.caption(("✅ " if ok else "⚠️ ") + msg)
 
-```powershell
-winget install Ollama.Ollama
-ollama pull qwen2.5vl:7b
-```
-
-AMD 內顯（無 CUDA）會用 CPU 推理，每張圖約 10～60 秒。
-
-**方案 B：OpenCV 模板比對（最快，只限固定遊戲畫面）**
-
-1. 截一張包含「一整排手牌」的圖，記下區塊 `x,y,w,h`
-2. 用工具自動裁出模板：
-
-```powershell
-python tools/make_templates.py screenshot.png --box 120,880,700,110 --labels 123m456p789s11z --debug
-```
-
-3. 重複幾次補齊 34 張，模板存於 `tile_templates/`
-
-> ⚠️ `easyocr` / `paddleocr` 係文字 OCR，認唔到麻雀牌圖案。
-"""
+        st.divider()
+        engine_label = st.selectbox(
+            "辨識方式",
+            ["自動（有模板用模板，否則用 AI）", "AI 視覺辨識", "OpenCV 模板比對"],
+            index=0,
         )
+        engine = {
+            "自動（有模板用模板，否則用 AI）": "auto",
+            "AI 視覺辨識": "ai",
+            "OpenCV 模板比對": "template",
+        }[engine_label]
 
-# ── 彙整手牌（手動 > 圖片 > 即時影相）──────────────────────
-manual_hand = tr.normalize_hand(hand_text)
-upload_hand = tr.normalize_hand(st.session_state.get("upload_hand", ""))
-camera_hand = tr.normalize_hand(st.session_state.get("camera_hand", ""))
+        tmpl_ok, tmpl_msg = tr.template_status()
+        if engine == "template":
+            st.caption(("✅ " if tmpl_ok else "⚠️ ") + tmpl_msg)
+        elif engine == "auto" and not tmpl_ok:
+            st.caption("ℹ️ 模板未齊全，會使用 AI 視覺辨識。")
 
-effective_hand, hand_source = "", ""
-for source, value in (
-    ("手動輸入", manual_hand),
-    ("圖片上傳", upload_hand),
-    ("即時影相", camera_hand),
-):
-    if value:
-        effective_hand, hand_source = value, source
-        break
+        per_tile = st.checkbox("先切牌逐張辨識（推薦）", value=True)
+        local_first = st.checkbox(
+            "⚡ 省 API 模式", value=False, disabled=not per_tile
+        )
+        st.caption("開啟會降低辨識準確度（本地分析會搶答難牌）")
 
-st.divider()
-if effective_hand:
-    st.markdown(
-        f"**目前手牌**（來自{hand_source}）　·　"
-        f"{tr.count_tiles(effective_hand)} 張"
-    )
-    ti.render_hand(effective_hand, height=54)
-    with st.expander("顯示牌局代碼（複製／除錯用）"):
-        st.code(effective_hand, language=None)
+# ── 頂部狀態 ────────────────────────────────────────────────
+or_ok = openrouter_connected(api_key) if provider == "openrouter" and api_key else False
+ml_ok = mlp.available()
+
+st.markdown(
+    f"""
+<div class="mj-header">
+  <div class="mj-brand">
+    <div class="mj-logo">🀄</div>
+    <div>
+      <div class="mj-title">日本麻雀 AI 助手</div>
+      <div class="mj-sub">入手牌 · 睇建議 · AI 解說</div>
+    </div>
+  </div>
+  <div class="mj-status">
+    <span class="chip {'ok' if or_ok else 'bad'}">● OpenRouter：{'已連接' if or_ok else '未連接'}</span>
+    <span class="chip {'ok' if ml_ok else 'bad'}">● 高手模型：{'已載入' if ml_ok else '未載入'}</span>
+  </div>
+</div>
+<div class="mj-steps">
+  <span class="step active">① 入手牌</span><span>→</span>
+  <span class="step">② 睇建議</span><span>→</span>
+  <span class="step">③ AI 解說</span>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+dora_tiles_preview, _ = scan_tiles(dora)
+if dora_tiles_preview:
+    dora_show = "、".join(tile_label(t) for t in dora_tiles_preview)
 else:
-    st.warning("尚未取得手牌，請在上面任何一個頁籤輸入或辨識。")
+    dora_show = dora.strip() or "無"
+st.markdown(
+    f'<div class="mj-mobile-summary">{bakaze}場 · 自風{jikaze} · {int(junme)} 巡目 · '
+    f'{"門清" if int(meld_count) == 0 else f"副露 {int(meld_count)} 組"} · 寶牌 {dora_show}</div>',
+    unsafe_allow_html=True,
+)
 
-# ── 精算（本機、即時、零成本）──────────────────────────────
-calc: dict = {}
-if effective_hand:
-    calc = cached_calc(effective_hand, bakaze, jikaze, dora.strip())
+# ── 手牌狀態 ────────────────────────────────────────────────
+if "hand_tiles" not in st.session_state:
+    st.session_state["hand_tiles"] = []
 
-    st.markdown("#### 🧮 精算結果（本機即時計算・準確）")
-    if calc.get("error"):
-        st.warning(calc["error"])
-    else:
-        st.markdown(
-            '<div style="background:#e9f7ef;border:1px solid #b7e2c6;'
-            'border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
-            + ti.decorate_text(calc.get("summary", ""), height=28)
-            + "</div>",
-            unsafe_allow_html=True,
+# ── ① 入手牌 ────────────────────────────────────────────────
+with st.container(key="input_card", border=True):
+    st.markdown("### ① 入手牌")
+
+    tab_camera, tab_upload, tab_manual = st.tabs(["📸 影相", "🖼️ 上傳圖片", "⌨️ 手入"])
+
+    with tab_camera:
+        camera_image = st.camera_input("對準手牌影相", key="camera_input")
+        if camera_image is not None:
+            st.image(camera_image, caption="擷取畫面", width="stretch")
+            data = camera_image.getvalue()
+            sig = hashlib.md5(data).hexdigest()
+            if st.session_state.get("camera_sig") != sig:
+                st.session_state["camera_sig"] = sig
+                rec_status: dict = {}
+                with st.spinner("即時辨識中..."):
+                    hand, msg = cached_recognize(
+                        data, engine, provider, api_key, vision_model,
+                        force=True, per_tile=per_tile, local_first=local_first,
+                        status=rec_status,
+                    )
+                if hand:
+                    set_hand(
+                        ti.expand_hand(hand), "即時影相",
+                        recognized=True, drawn=rec_status.get("drawn"),
+                        meld_tiles=rec_status.get("meld_tiles") or [],
+                    )
+                    st.session_state["recognize_msg"] = msg
+                    st.rerun()
+                st.session_state["recognize_msg"] = msg
+            if st.button("🔄 重新辨識", key="btn_camera_retry"):
+                st.session_state.pop("camera_sig", None)
+                st.rerun()
+
+    with tab_upload:
+        uploaded_image = st.file_uploader(
+            "將截圖或相片拖放至此，或點擊上傳",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=False,
+            label_visibility="visible",
+        )
+        st.caption("💡 截圖辨識率最高；實體相片若因光線／角度認錯，可於下方逐隻修改。")
+
+        if uploaded_image is not None:
+            st.image(uploaded_image, caption="已上傳的圖片", width="stretch")
+            with st.expander("🔍 裁剪設定", expanded=False):
+                bottom_pct = st.slider(
+                    "只分析畫面底部百分比", 15, 100, 100, 5,
+                    help="完整遊戲截圖先需要裁剪；純手牌條通常保持 100。",
+                )
+            c1, c2 = st.columns(2)
+            do_recognize = c1.button("🔍 辨識手牌", key="btn_upload_ocr", width="stretch")
+            do_force = c2.button("🔄 重新辨識", key="btn_upload_ocr_force", width="stretch")
+
+            if do_recognize or do_force:
+                rec_status: dict = {}
+                with st.spinner("辨識中..."):
+                    hand, msg = cached_recognize(
+                        uploaded_image.getvalue(), engine, provider, api_key,
+                        vision_model, force=do_force, bottom_pct=bottom_pct,
+                        per_tile=per_tile, local_first=local_first,
+                        status=rec_status,
+                    )
+                st.session_state["recognize_msg"] = msg
+                if hand:
+                    set_hand(
+                        ti.expand_hand(hand), "圖片上傳",
+                        recognized=True, drawn=rec_status.get("drawn"),
+                        meld_tiles=rec_status.get("meld_tiles") or [],
+                    )
+                    st.rerun()
+
+    with tab_manual:
+        hand_text = st.text_input(
+            "手牌代碼",
+            placeholder="例如：34m 4p 1234s 555667z 9p",
+            key="manual_hand_text",
+            label_visibility="collapsed",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("用呢手牌", type="primary", width="stretch"):
+            _meld_flat = [t for g in st.session_state.get("meld_tiles", []) for t in g]
+            tiles, err = parse_hand_codes(
+                hand_text, int(meld_count),
+                meld_total=len(_meld_flat) if _meld_flat else None,
+                meld_codes=_meld_flat or None,
+            )
+            if tiles is None:
+                st.session_state["hand_error"] = err
+            else:
+                set_hand(tiles, "手動輸入")
+                st.rerun()
+        if c2.button("⌨️ 開啟選牌盤", width="stretch"):
+            st.session_state["picker"] = {"mode": "add", "index": None}
+            st.rerun()
+
+        st.caption(
+            "格式：數字＋花色（m 萬 · p 筒 · s 索 · z 字：1東 2南 3西 4北 5白 6發 7中）；"
+            "赤五 5mr；可連寫，如 123m。"
         )
 
-        if calc.get("discards"):
-            rows = [
-                {
-                    "tile": d["tile"],
-                    "shanten": d["shanten"],
-                    "ukeire_count": d["ukeire_count"],
-                    "ukeire": d["ukeire"],
-                }
-                for d in calc["discards"][:6]
-            ]
-            st.markdown(ti.discard_table_html(rows), unsafe_allow_html=True)
+    if st.session_state.get("hand_error"):
+        st.error(st.session_state["hand_error"])
+    if st.session_state.get("recognize_msg"):
+        _msg = st.session_state["recognize_msg"]
+        if "切牌失敗" in _msg or "⚠️" in _msg:
+            st.warning(_msg)
+        else:
+            st.caption(_msg)
 
-        if calc.get("waits"):
-            st.markdown("**待牌**")
-            st.markdown(ti.waits_html(calc["waits"]), unsafe_allow_html=True)
-            with st.expander("顯示待牌代碼"):
-                st.code(
-                    " ".join(t for t, _ in calc["waits"]), language=None
+# ── 推算（手牌、精算、模型）─────────────────────────────────
+hand_tiles: list[str] = list(st.session_state.get("hand_tiles", []))
+meld_tiles: list[list[str]] = [list(g) for g in st.session_state.get("meld_tiles", [])]
+meld_flat: list[str] = [t for g in meld_tiles for t in g]
+plain_hand = hand_to_plain(hand_tiles) if hand_tiles else ""
+
+calc: dict = {}
+direction_hints, confirmed_yaku = "無明顯役種方向", []
+preds: list[dict] | None = None
+preds_err = ""
+
+if plain_hand:
+    direction_hints, confirmed_yaku = yh.inspect(
+        plain_hand, bakaze, jikaze, int(meld_count), meld_flat or None
+    )
+    if not meld_flat:
+        calc = cached_calc(plain_hand, bakaze, jikaze, dora.strip())
+
+if hand_tiles and mlp.available():
+    preds, preds_err = mlp.suggest(
+        hand_tiles, dora, meld_count=int(meld_count), top=5
+    )
+
+model_preds_text = ""
+if preds:
+    honor_names = {"E": "東", "S": "南", "W": "西", "N": "北", "P": "白板", "F": "發", "C": "中"}
+    lines = []
+    for rank, item in enumerate(preds, 1):
+        label = item["ml"]
+        if label in honor_names:
+            label = f"{label}（{honor_names[label]}）"
+        lines.append(f"{rank}. {label} — {item['p'] * 100:.1f}%")
+    model_preds_text = "\n".join(lines)
+
+riichi_ref = None
+if preds:
+    riichi_ref = _riichi_reference(
+        hand_tiles, preds[0]["tile"], int(junme), int(meld_count),
+        bakaze, jikaze, dora,
+    )
+
+# ── ② 你嘅手牌 ──────────────────────────────────────────────
+with st.container(key="hand_card", border=True):
+    st.markdown("### ② 你嘅手牌")
+
+    if not hand_tiles:
+        st.info("未有手牌。用上面任何一個方法入手牌，或載入範例。")
+    else:
+        drawn = st.session_state.get("hand_drawn")
+        display_tiles = list(hand_tiles)
+        index_map = list(range(len(hand_tiles)))
+        draw_idx = None
+
+        if len(hand_tiles) % 3 == 2:
+            if drawn:
+                base = drawn[:-1] if drawn.endswith("r") else drawn
+                cands = [
+                    i for i, t in enumerate(hand_tiles)
+                    if (t[:-1] if t.endswith("r") else t) == base
+                ]
+                if cands:
+                    # 將摸入嗰隻抽出，其餘 13 隻照舊排序，摸入放最右
+                    pick = cands[-1]
+                    draw_tile = hand_tiles[pick]
+                    display_tiles = [t for i, t in enumerate(hand_tiles) if i != pick]
+                    index_map = [i for i in range(len(hand_tiles)) if i != pick]
+                    display_tiles.append(draw_tile)
+                    index_map.append(pick)
+                    draw_idx = len(display_tiles) - 1
+            else:
+                draw_idx = len(display_tiles) - 1
+
+        tile_css = []
+        for idx, tile in enumerate(display_tiles):
+            uri = ti.tile_uri(tile, 96)
+            if uri:
+                tile_css.append(
+                    f'.st-key-tilebtn_{idx} button{{background-image:url("{uri}");}}'
                 )
+        if tile_css:
+            st.markdown(f"<style>{''.join(tile_css)}</style>", unsafe_allow_html=True)
 
-        if calc.get("agari_preview"):
-            st.markdown("**和牌預覽**（榮和、門清）：")
-            for v in calc["agari_preview"]:
-                yaku = "、".join(v["yaku"]) or "無役"
-                cost = (v.get("cost") or {}).get("main", 0)
+        meld_css = []
+        for gi, group in enumerate(meld_tiles):
+            for mi, tile in enumerate(group):
+                uri = ti.tile_uri(tile, 96)
+                if uri:
+                    meld_css.append(
+                        f'.st-key-meldbtn_{gi}_{mi} button{{background-image:url("{uri}");}}'
+                    )
+        if meld_css:
+            st.markdown(f"<style>{''.join(meld_css)}</style>", unsafe_allow_html=True)
+
+        left, right = st.columns([5, 1.4], gap="medium")
+        with left:
+            with st.container(horizontal=True, gap="small", wrap=True, vertical_alignment="bottom"):
+                for disp_idx, tile in enumerate(display_tiles):
+                    real_idx = index_map[disp_idx]
+                    if draw_idx is not None and disp_idx == draw_idx:
+                        st.markdown("<div style='width:16px'></div>", unsafe_allow_html=True)
+                        with st.container(vertical_alignment="bottom"):
+                            st.markdown('<div class="draw-label">摸入</div>', unsafe_allow_html=True)
+                            if st.button(
+                                " ", key=f"tilebtn_{disp_idx}",
+                                help=f"{tile_label(tile)}（點擊修改）",
+                            ):
+                                st.session_state["picker"] = {"mode": "replace", "index": real_idx}
+                                st.rerun()
+                    else:
+                        if st.button(
+                            " ", key=f"tilebtn_{disp_idx}",
+                            help=f"{tile_label(tile)}（點擊修改）",
+                        ):
+                            st.session_state["picker"] = {"mode": "replace", "index": real_idx}
+                            st.rerun()
+
+        with right:
+            if meld_tiles:
+                st.markdown("**副露**")
+                for gi, group in enumerate(meld_tiles):
+                    with st.container(horizontal=True, gap="small", wrap=True):
+                        for mi, tile in enumerate(group):
+                            if st.button(
+                                " ", key=f"meldbtn_{gi}_{mi}",
+                                help=f"{tile_label(tile)}（點擊修改副露）",
+                            ):
+                                st.session_state["picker"] = {
+                                    "mode": "replace", "target": "meld",
+                                    "group": gi, "index": mi,
+                                }
+                                st.rerun()
+            elif int(meld_count) == 0:
                 st.markdown(
-                    f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;'
-                    f'margin:4px 0;">'
-                    f'<span style="color:#666;font-size:0.9rem;">待</span>'
-                    f'{ti.inline_html(v["wait"], 30)}'
-                    f'<span>{yaku}　{v["han"]} 翻 {v["fu"]} 符　{cost} 點</span></div>',
+                    '<div class="meld-box">門清 — 冇副露<br>食・碰・槓顯示喺呢度</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                faces = "".join(
+                    '<span style="display:inline-block;width:22px;height:30px;margin:2px;'
+                    'border-radius:4px;background:var(--panel2);'
+                    'border:1px solid var(--line);"></span>'
+                    for _ in range(int(meld_count) * 3)
+                )
+                st.markdown(
+                    f'<div class="meld-box">副露 {int(meld_count)} 組<br>{faces}</div>',
                     unsafe_allow_html=True,
                 )
 
-        if calc.get("agari"):
-            for kind, v in calc["agari"].items():
-                yaku = "、".join(v["yaku"]) or "無役"
-                st.markdown(f"- **{kind}**：{yaku}　{v['han']} 翻 {v['fu']} 符")
+        st.caption("點擊牌面可修正辨識錯誤（✎）。")
 
-        st.caption("以上由麻雀計算引擎精確算出（唔涉及 AI，唔會出錯）。")
-
-# ── 分析 ────────────────────────────────────────────────────
-st.divider()
-
-col_btn, _ = st.columns([1, 3])
-with col_btn:
-    analyze_btn = st.button(
-        "🚀 開始 AI 深度牌局分析",
-        type="primary",
-        width="stretch",
-    )
-
-if analyze_btn:
-    if not effective_hand:
-        st.error("請先輸入手牌或完成辨識，再開始分析。")
-    elif provider == "openrouter" and not api_key:
-        st.error("雲端模式需要 OpenRouter API Key，請先在左側輸入。")
-    else:
-        ctx = {
-            "bakaze": bakaze,
-            "jikaze": jikaze,
-            "junme": junme,
-            "dora": dora.strip(),
-            "riichi": alert_riichi,
-            "meld": alert_meld,
-        }
-        label = "☁️ 雲端模型" if provider == "openrouter" else "💻 本機模型"
-        facts = me.format_facts(calc) if calc else ""
-        with st.spinner(f"{label}分析中，請稍候..."):
-            text, msg = ai.analyze_hand(
-                effective_hand,
-                ctx,
-                backend=provider,
-                api_key=api_key,
-                model=analysis_model,
-                facts=facts,
-            )
-        st.session_state["analysis"] = {
-            "hand": effective_hand,
-            "text": text,
-            "msg": msg,
-            "provider": provider,
-        }
-
-result = st.session_state.get("analysis")
-if result:
-    if result.get("text"):
-        st.success(result["msg"])
-        st.subheader("📊 分析結果")
-        with st.container(border=True):
+# ── 首選大卡 ────────────────────────────────────────────────
+if preds:
+    top = preds[0]
+    second = preds[1] if len(preds) > 1 else None
+    top_tile = display_tile(top["tile"], hand_tiles)
+    second_tile = display_tile(second["tile"], hand_tiles) if second else None
+    diff = (top["p"] - second["p"]) * 100 if second else 0.0
+    with st.container(key="hero_card", border=True):
+        st.markdown("### 🏆 首選建議")
+        c1, c2 = st.columns([1, 3.2], gap="medium")
+        with c1:
+            st.markdown(ti.inline_html(top_tile, 96), unsafe_allow_html=True)
+        with c2:
             st.markdown(
-                ti.decorate_text(result["text"], height=26),
+                f'<div class="hero-name">{tile_label(top_tile)}</div>'
+                f'<div class="hero-pct">{top["p"] * 100:.1f}%</div>'
+                + (
+                    f'<span class="hero-chip">領先次選（{tile_label(second_tile)}）+{diff:.1f}%</span>'
+                    if second
+                    else ""
+                ),
                 unsafe_allow_html=True,
             )
-        st.caption(result["msg"])
-        st.warning(
-            "⚠️ AI 分析僅供參考，可能有錯（例如誤判役種、向聽數）。重要決定請自行核對。"
+            st.caption("由高手模型（handonly_model）計算，只考慮手牌、寶牌指示及副露數。")
+elif preds_err:
+    st.info(preds_err)
+
+# ── ③ AI 解說（全闊）─────────────────────────────────────────
+with st.container(key="ai_card", border=True):
+    head_l, head_r = st.columns([3.2, 1])
+    with head_l:
+        st.markdown("### ③ AI 解說")
+    with head_r:
+        analyze_btn = st.button(
+            "🚀 AI 深度分析",
+            type="primary",
+            width="stretch",
+            disabled=not bool(hand_tiles),
         )
+
+    ctx = {
+        "bakaze": bakaze,
+        "jikaze": jikaze,
+        "junme": junme,
+        "dora": dora.strip(),
+        "riichi": alert_riichi,
+        "meld": alert_meld,
+        "meld_count": int(meld_count),
+    }
+    facts = (
+        me.format_facts(calc)
+        .replace("精算結果", "牌理分析結果")
+        .replace("精算", "牌理")
+        .replace("Pinfu", "平和")
+        .replace("Tanyao", "斷么九")
+        .replace("Honitsu", "混一色")
+        .replace("Chiitoitsu", "七對子")
+        .replace("Chiitoi", "七對子")
+        .replace("Ittsu", "一氣通貫")
+        .replace("Sanshoku", "三色同順")
+        if calc
+        else ""
+    )
+    if meld_tiles:
+        facts += _meld_facts(meld_tiles)
+    if riichi_ref:
+        facts += _riichi_facts(riichi_ref)
+    analysis_sig = (
+        plain_hand,
+        bakaze,
+        jikaze,
+        int(junme),
+        dora.strip(),
+        bool(alert_riichi),
+        bool(alert_meld),
+        int(meld_count),
+        model_preds_text,
+        direction_hints,
+        analysis_model,
+        provider,
+    )
+
+    rendered = False
+
+    if analyze_btn:
+        if not hand_tiles:
+            st.error("請先輸入手牌。")
+        elif provider == "openrouter" and not api_key:
+            st.error("雲端模式需要 OpenRouter API Key，請先在左側 AI 設定輸入。")
+        else:
+            prev = st.session_state.get("analysis")
+            if prev and prev.get("sig") == analysis_sig and prev.get("text"):
+                st.info("已重用上次解說（手牌／局勢／模型建議冇變），冇再呼叫 API。")
+            else:
+                ph = st.empty()
+                ph.markdown(
+                    '<div class="sk-line w90"></div><div class="sk-line w70"></div>'
+                    '<div class="sk-line w90"></div><div class="sk-line w50"></div>',
+                    unsafe_allow_html=True,
+                )
+                status: dict = {}
+                text, msg = None, ""
+                try:
+                    ph.empty()
+                    with st.spinner("AI 解說生成中…"):
+                        with ph.container():
+                            streamed = st.write_stream(
+                                ai.stream_analysis(
+                                    plain_hand, ctx,
+                                    backend=provider,
+                                    api_key=api_key,
+                                    model=analysis_model,
+                                    facts=facts,
+                                    model_preds=model_preds_text,
+                                    direction_hints=direction_hints,
+                                    status=status,
+                                )
+                            )
+                    text = (streamed or "").strip()
+                    if not text:
+                        raise ai.AIError("模型冇回傳內容。")
+                    used_model = status.get("model", analysis_model)
+                    msg = f"分析完成（{used_model}，串流）"
+                    if used_model != analysis_model and status.get("primary_error"):
+                        msg += (
+                            f"　⚠️ 主模型 {analysis_model} 暫時不可用"
+                            f"（{ai._short_reason(status['primary_error'])}），已自動轉用備援。"
+                        )
+                    ph.empty()
+                    with ph.container():
+                        st.markdown(
+                            ti.decorate_text(text, height=26),
+                            unsafe_allow_html=True,
+                        )
+                    st.caption(msg)
+                    rendered = True
+                except Exception:  # noqa: BLE001 — 串流失敗 → 自動 fallback 非串流
+                    ph.empty()
+                    with st.spinner("串流失敗，改用普通模式分析中..."):
+                        text, msg = ai.analyze_hand(
+                            plain_hand, ctx,
+                            backend=provider,
+                            api_key=api_key,
+                            model=analysis_model,
+                            facts=facts,
+                            model_preds=model_preds_text,
+                            direction_hints=direction_hints,
+                        )
+                    if text:
+                        with ph.container():
+                            st.markdown(
+                                ti.decorate_text(text, height=26),
+                                unsafe_allow_html=True,
+                            )
+                        st.caption(msg)
+                        rendered = True
+
+                st.session_state["analysis"] = {
+                    "hand": plain_hand,
+                    "text": text,
+                    "msg": msg,
+                    "provider": provider,
+                    "sig": analysis_sig,
+                }
+                st.session_state["recognized_notice"] = False
+
+    result = st.session_state.get("analysis")
+    if not rendered and result:
+        if result.get("text"):
+            with st.container():
+                st.markdown(
+                    ti.decorate_text(result["text"], height=26),
+                    unsafe_allow_html=True,
+                )
+            st.caption(result["msg"])
+            st.warning(
+                "⚠️ AI 解說僅供參考，可能有錯（例如誤判役種、向聽數）。重要決定請自行核對。"
+            )
+        else:
+            st.error(f"分析失敗：{result.get('msg', '未知錯誤')}")
+    elif not analyze_btn and not result:
+        if st.session_state.get("recognized_notice"):
+            st.info(
+                "認牌完成 — 請先核對牌面（撳任何一隻牌可以改牌），"
+                "確認後再㩒『AI 深度分析』。"
+            )
+        elif hand_tiles:
+            st.caption("撳「🚀 AI 深度分析」，AI 會跟住高手模型第一位同牌理數字講解。")
+        else:
+            st.caption("入手牌之後，呢度會顯示 AI 解說。")
+# ── 底部：Top 5 ＋ 精算 ─────────────────────────────────────
+st.write("")
+bottom_left, bottom_right = st.columns([1, 1.15], gap="medium")
+
+with bottom_left:
+    with st.container(key="top5_card", border=True):
+        st.markdown("### 🏆 模型建議 Top 5")
+        st.caption("高手實戰選擇（計埋役種價值）")
+        if not hand_tiles:
+            st.caption("入手牌後顯示。")
+        elif preds:
+            for rank, item in enumerate(preds, 1):
+                disp_tile = display_tile(item["tile"], hand_tiles)
+                st.markdown(
+                    f'<div class="compact-row">'
+                    f'<span style="width:14px;color:var(--muted);font-size:.78rem;">{rank}</span>'
+                    f'{ti.inline_html(disp_tile, 26)}'
+                    f'<span style="min-width:34px;font-size:.78rem;">{tile_label(disp_tile)}</span>'
+                    f'<div class="compact-bar"><div style="width:{item["p"] * 100:.1f}%;"></div></div>'
+                    f'<span style="min-width:48px;text-align:right;font-size:.78rem;'
+                    f'font-variant-numeric:tabular-nums;">{item["p"] * 100:.1f}%</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+        elif preds_err:
+            st.caption(preds_err)
+        else:
+            st.caption("模型未載入。")
+
+with bottom_right:
+    with st.container(key="calc_card", border=True):
+        st.markdown("### 📐 牌理分析")
+        st.caption("純牌效率：向聽＋進張數，唔計役種")
+        if not plain_hand:
+            st.caption("入手牌後即時計算。")
+        elif meld_flat:
+            st.caption("副露手牌：牌理分析暫只支援門清 13/14 張。")
+            st.markdown("**🏆 役種**")
+            st.markdown(f"- 已確定役牌：{'、'.join(confirmed_yaku) or '暫無'}")
+            st.markdown(f"- 潛在方向：{direction_hints}")
+        elif calc.get("error"):
+            st.warning(calc["error"])
+        else:
+            if calc.get("discards"):
+                best_discard = calc["discards"][0]
+                best_tile = display_tile(best_discard["tile"], hand_tiles)
+                headline = (
+                    f"{best_discard['shanten']} 向聽 · 進張最闊："
+                    f"切{best_tile}（{best_discard['ukeire_count']} 張）"
+                )
+            else:
+                headline = calc.get("summary", "")
+            st.markdown(
+                '<div style="background:var(--panel2);'
+                'border:1px solid var(--line);border-radius:12px;'
+                'padding:10px 14px;margin-bottom:8px;">'
+                + ti.decorate_text(headline, height=26)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+            if riichi_ref:
+                st.caption(
+                    f"📊 同類等牌，高手首次聽牌立直率約 {riichi_ref['rate']:.1f}%"
+                )
+
+            if calc.get("discards"):
+                rows = [
+                    {
+                        "tile": display_tile(d["tile"], hand_tiles),
+                        "shanten": d["shanten"],
+                        "ukeire_count": d["ukeire_count"],
+                        "ukeire": d["ukeire"],
+                    }
+                    for d in calc["discards"][:6]
+                ]
+                st.markdown(ti.discard_table_html(rows), unsafe_allow_html=True)
+
+            if calc.get("waits"):
+                st.markdown("**待牌**")
+                st.markdown(ti.waits_html(calc["waits"]), unsafe_allow_html=True)
+
+            if calc.get("agari_preview"):
+                st.markdown("**和牌預覽**（榮和、門清）：")
+                for v in calc["agari_preview"]:
+                    yaku = "、".join(v["yaku"]) or "無役"
+                    cost = (v.get("cost") or {}).get("main", 0)
+                    st.markdown(
+                        f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:4px 0;">'
+                        f'<span style="color:var(--muted);font-size:0.9rem;">待</span>'
+                        f'{ti.inline_html(v["wait"], 28)}'
+                        f'<span>{yaku}　{v["han"]} 翻 {v["fu"]} 符　{cost} 點</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+            if calc.get("agari"):
+                for kind, v in calc["agari"].items():
+                    yaku = "、".join(v["yaku"]) or "無役"
+                    st.markdown(f"- **{kind}**：{yaku}　{v['han']} 翻 {v['fu']} 符")
+
+            if not calc.get("agari_preview") and not calc.get("agari"):
+                st.markdown("**🏆 役種**")
+                st.markdown(f"- 已確定役牌：{'、'.join(confirmed_yaku) or '暫無'}")
+                st.markdown(f"- 潛在方向：{direction_hints}")
+
+            st.caption("以上由麻雀計算引擎精確算出（唔涉及 AI）。")
+
+
+# ── 選牌盤 ──────────────────────────────────────────────────
+def _apply_pick(tile: str) -> None:
+    info = st.session_state.get("picker") or {}
+    mode = info.get("mode", "add")
+    index = info.get("index")
+
+    if info.get("target") == "meld":
+        groups = [list(g) for g in st.session_state.get("meld_tiles", [])]
+        gi, mi = info.get("group"), info.get("index")
+        if gi is not None and mi is not None and 0 <= gi < len(groups) and 0 <= mi < len(groups[gi]):
+            groups[gi][mi] = tile
+        st.session_state["meld_tiles"] = groups
+        st.session_state["meld_count_pending"] = len(groups)
+        st.session_state.pop("analysis", None)
+        st.session_state["recognized_notice"] = False
+        st.session_state.pop("picker", None)
+        st.rerun()
+        return
+
+    tiles = list(st.session_state.get("hand_tiles", []))
+
+    base = tile[:-1] if tile.endswith("r") else tile
+    count = sum(1 for t in tiles if (t[:-1] if t.endswith("r") else t) == base)
+    if mode != "replace" and count >= 4:
+        st.warning(f"{base} 已經有 4 隻，唔可以再加。")
+        return
+
+    if mode == "replace" and index is not None and 0 <= index < len(tiles):
+        tiles[index] = tile
     else:
-        st.error(f"分析失敗：{result.get('msg', '未知錯誤')}")
-elif not analyze_btn:
-    if effective_hand:
-        st.info("💡 上方已顯示本機精算結果；如要 AI 深入解說，點擊「開始 AI 深度牌局分析」。")
+        if len(tiles) >= 14:
+            st.warning("手牌已經有 14 隻。")
+            return
+        tiles.append(tile)
+
+    st.session_state["hand_tiles"] = tiles
+    st.session_state["hand_source"] = "選牌盤修正"
+    st.session_state["hand_drawn"] = None
+    st.session_state.pop("analysis", None)
+    st.session_state["recognized_notice"] = False
+    st.session_state.pop("picker", None)
+    st.rerun()
+
+
+@st.dialog("🀄 選牌盤")
+def tile_picker_dialog() -> None:
+    info = st.session_state.get("picker") or {}
+    mode = info.get("mode", "add")
+    index = info.get("index")
+    if info.get("target") == "meld":
+        gi, mi = info.get("group"), info.get("index")
+        try:
+            current = st.session_state["meld_tiles"][gi][mi]
+            st.caption(f"替換副露第 {gi + 1} 組、第 {mi + 1} 隻（{tile_label(current)}）")
+        except Exception:  # noqa: BLE001
+            st.caption("修改副露")
+    elif mode == "replace" and index is not None:
+        current = (st.session_state.get("hand_tiles") or [])[index]
+        st.caption(f"替換第 {index + 1} 隻（{tile_label(current)}）")
     else:
-        st.info("💡 請完成局勢設定與手牌輸入後，點擊上方按鈕開始 AI 深度牌局分析")
+        st.caption("揀一隻牌加入手牌")
+
+    # 牌掣用真牌圖（per-key CSS background-image），右上角加代碼 badge
+    badge_style = (
+        "position:absolute;top:2px;right:3px;font-size:9px;line-height:1;"
+        "padding:2px 3px;border-radius:4px;background:rgba(13,19,15,.55);"
+        "color:#f7f2df;font-weight:600;pointer-events:none;z-index:2;"
+    )
+    picker_css: list[str] = [
+        '[class*="st-key-pick_"] button{'
+        "height:auto !important;aspect-ratio:3/4;min-height:0 !important;"
+        "width:100%;padding:0 !important;"
+        "background-size:contain;background-repeat:no-repeat;background-position:center;"
+        "background-color:var(--tile);border:1px solid var(--tile-edge);"
+        "border-radius:8px;position:relative;overflow:hidden;"
+        "}",
+        '[class*="st-key-pick_"] button p{display:none;}',
+        '.st-key-pick_m_red,.st-key-pick_p_red,.st-key-pick_s_red{'
+        "max-width:56px !important;margin-left:auto !important;margin-right:auto !important;}",
+    ]
+
+    def _add_tile_css(key: str, code: str) -> None:
+        uri = ti.tile_uri(code, 96)
+        if not uri:
+            return
+        picker_css.append(f'.st-key-{key} button{{background-image:url("{uri}");}}')
+        picker_css.append(
+            f'.st-key-{key} button::after{{content:"{code}";{badge_style}}}'
+        )
+
+    for suit in "mps":
+        for n in range(1, 10):
+            _add_tile_css(f"pick_{suit}{n}", f"{n}{suit}")
+
+    for n in range(1, 8):
+        _add_tile_css(f"pick_z{n}", f"{n}z")
+
+    for suit in "mps":
+        _add_tile_css(f"pick_{suit}_red", f"5{suit}r")
+
+    st.markdown(f"<style>{''.join(picker_css)}</style>", unsafe_allow_html=True)
+
+    for suit, title in (("m", "萬子"), ("p", "筒子"), ("s", "索子")):
+        st.markdown(f"**{title}**")
+        cols = st.columns(9)
+        for n in range(1, 10):
+            if cols[n - 1].button(f"{n}{suit}", key=f"pick_{suit}{n}", width="stretch"):
+                _apply_pick(f"{n}{suit}")
+
+    st.markdown("**字牌**")
+    cols = st.columns(7)
+    for n, name in enumerate(["東", "南", "西", "北", "白", "發", "中"], 1):
+        if cols[n - 1].button(name, key=f"pick_z{n}", width="stretch"):
+            _apply_pick(f"{n}z")
+
+    st.markdown("**赤五**")
+    cols = st.columns(3)
+    for k, suit in enumerate("mps"):
+        if cols[k].button(f"赤5{suit}", key=f"pick_{suit}_red", width="stretch"):
+            _apply_pick(f"5{suit}r")
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    if c1.button("🗑️ 清除", width="stretch"):
+        info = st.session_state.get("picker") or {}
+        if info.get("target") == "meld":
+            groups = [list(g) for g in st.session_state.get("meld_tiles", [])]
+            gi, mi = info.get("group"), info.get("index")
+            if gi is not None and mi is not None and 0 <= gi < len(groups) and 0 <= mi < len(groups[gi]):
+                groups[gi].pop(mi)
+                if not groups[gi]:
+                    groups.pop(gi)
+            st.session_state["meld_tiles"] = groups
+            st.session_state["meld_count_pending"] = len(groups)
+            st.session_state.pop("analysis", None)
+            st.session_state["recognized_notice"] = False
+            st.session_state.pop("picker", None)
+            st.rerun()
+        else:
+            tiles = list(st.session_state.get("hand_tiles", []))
+            if mode == "replace" and index is not None and 0 <= index < len(tiles):
+                tiles.pop(index)
+            elif tiles:
+                tiles.pop()
+            st.session_state["hand_tiles"] = tiles
+            st.session_state["hand_source"] = "選牌盤修正"
+            st.session_state["hand_drawn"] = None
+            st.session_state.pop("analysis", None)
+            st.session_state["recognized_notice"] = False
+            st.session_state.pop("picker", None)
+            st.rerun()
+    if c2.button("完成", type="primary", width="stretch"):
+        st.session_state.pop("picker", None)
+        st.rerun()
+
+
+def _close_yaku_dialog() -> None:
+    st.session_state["yaku_open"] = False
+
+
+@st.dialog(
+    "📖 役種一覽",
+    width="large",
+    on_dismiss=_close_yaku_dialog,
+)
+def _yaku_dialog() -> None:
+    st.markdown(
+        """
+<style>
+[data-testid="stDialog"] section[role="dialog"]{
+  max-width:min(900px,94vw) !important;width:min(900px,94vw) !important;
+  margin-left:auto !important;margin-right:auto !important;}
+[data-testid="stDialog"]{overflow-y:auto !important;}
+.yaku-card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;margin:8px 0;}
+.yaku-head{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.yaku-name{color:var(--text);font-weight:700;font-size:1rem;}
+.yaku-tag{font-size:.72rem;color:var(--gold);border:1px solid var(--gold2);
+  border-radius:999px;padding:2px 8px;white-space:nowrap;}
+.yaku-desc{color:var(--muted);font-size:.8rem;line-height:1.5;margin-top:4px;}
+.yaku-ex{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px;}
+.yaku-grp{display:inline-flex;gap:1px;padding-right:6px;}
+.yaku-foot{color:var(--muted);font-size:.78rem;line-height:1.6;margin-top:14px;
+  border-top:1px dashed var(--line);padding-top:10px;}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    search = st.text_input(
+        "搜尋役種",
+        placeholder="搜尋役名或關鍵字，例如：混、順子、字牌",
+        label_visibility="collapsed",
+        key="yaku_search",
+    )
+    selected = st.pills(
+        "翻數",
+        ["全部", "一翻", "二翻", "三翻", "六翻", "役滿", "狀況"],
+        default="全部",
+        selection_mode="single",
+        key="yaku_filter",
+    ) or "全部"
+
+    group_for_filter = {
+        "一翻": "一翻役",
+        "二翻": "二翻役",
+        "三翻": "三翻役",
+        "六翻": "六翻役",
+        "役滿": "役滿",
+        "狀況": "狀況役",
+    }
+    q = (search or "").strip().lower()
+    shown = 0
+
+    for group_title, items in yc.YAKU_GROUPS:
+        if selected != "全部" and group_title != group_for_filter.get(selected):
+            continue
+        matched = [
+            item for item in items
+            if not q or q in f"{item['name']} {item['desc']}".lower()
+        ]
+        if not matched:
+            continue
+        st.markdown(f"### {group_title}")
+        for item in matched:
+            examples = []
+            for group in item.get("example") or []:
+                imgs = ti.inline_html(group, 40)  # 高度 40px ≈ 闊 30px
+                if imgs:
+                    examples.append(f'<span class="yaku-grp">{imgs}</span>')
+            ex_html = (
+                f'<div class="yaku-ex">{"".join(examples)}</div>' if examples else ""
+            )
+            st.markdown(
+                f'<div class="yaku-card">'
+                f'<div class="yaku-head"><span class="yaku-name">{item["name"]}</span>'
+                f'<span class="yaku-tag">{item["han"]}</span></div>'
+                f'<div class="yaku-desc">{item["desc"]}</div>'
+                f"{ex_html}</div>",
+                unsafe_allow_html=True,
+            )
+            shown += 1
+
+    if shown == 0:
+        st.info("搵唔到符合嘅役種")
+    else:
+        st.caption(f"顯示 {shown} / {sum(len(items) for _, items in yc.YAKU_GROUPS)} 項")
+
+    st.markdown(f'<div class="yaku-foot">{yc.FOOTER_NOTE}</div>', unsafe_allow_html=True)
+    if st.button("關閉", type="primary", width="stretch"):
+        st.session_state["yaku_open"] = False
+        st.rerun()
+
+
+if st.session_state.get("picker"):
+    tile_picker_dialog()
+
+if st.session_state.get("yaku_open"):
+    _yaku_dialog()
