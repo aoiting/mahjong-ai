@@ -107,19 +107,23 @@ def parse_hand_codes(
     meld_total: int | None = None,
     meld_codes: list[str] | None = None,
 ) -> tuple[list[str] | None, str]:
-    """手牌隻數＋副露總隻數必須係 13 或 14；每種牌合共唔可以過 4。"""
+    """手牌隻數＋副露有效隻數必須係 13 或 14；每種牌合共唔可以過 4。
+
+    `meld_total` 係副露「有效隻數」：每組不論 3 隻定 4 隻（槓）都當 3 隻。
+    每種牌實際隻數嘅上限檢查仍然用 `meld_codes` 入面嘅真實牌數。
+    """
     tiles, err = scan_tiles(text)
     if tiles is None:
         return None, err
-    meld_total = (
-        len(meld_codes) if meld_codes is not None
-        else (int(meld_total) if meld_total is not None else 3 * int(meld_count))
+    effective_meld_total = (
+        int(meld_total) if meld_total is not None else 3 * int(meld_count)
     )
-    total = len(tiles) + meld_total
+    total = len(tiles) + effective_meld_total
     if total not in (13, 14):
         return None, (
-            f"手牌 {len(tiles)} 隻 ＋ 副露 {meld_total} 隻 ＝ {total} 隻，"
-            "應該要係 13 或 14 隻。"
+            f"手牌 {len(tiles)} 隻 ＋ 副露 {effective_meld_total} 隻"
+            "（每組計 3 隻）＝ "
+            f"{total} 隻，應該要係 13 或 14 隻。"
         )
     counts: dict[str, int] = {}
     for tile in list(tiles) + list(meld_codes or []):
@@ -215,7 +219,12 @@ def _recognize_now(
                     groups = ai.group_meld_tiles(meld_codes)
                     status["meld_tiles"] = groups
                     status["meld_count"] = len(groups)
-                    status["drawn"] = None
+                    # 有副露時，摸入牌係「手牌區最後一格」（副露區之前），
+                    # 唔可以俾之後嘅排序影響佢嘅身份。
+                    effective_total = len(hand_codes) + 3 * len(groups)
+                    status["drawn"] = (
+                        hand_codes[-1] if effective_total == 14 and hand_codes else None
+                    )
                     hand = " ".join(ai._sorted_hand_tokens(hand_codes))
                     note = (
                         f"逐張辨識完成（手牌 {len(hand_codes)} 隻 + 副露 {len(meld_codes)} 隻）："
@@ -223,9 +232,10 @@ def _recognize_now(
                     )
                     if any(len(g) not in (3, 4) for g in groups):
                         note += "\n⚠️ 副露分組唔勻（剩 1–2 隻），請逐隻核對。"
-                    if len(hand_codes) + len(meld_codes) not in (13, 14):
+                    if effective_total not in (13, 14):
                         note += (
-                            f"\n⚠️ 手牌＋副露共 {len(hand_codes) + len(meld_codes)} 隻，"
+                            f"\n⚠️ 手牌＋副露有效共 {effective_total} 隻"
+                            f"（副露 {len(groups)} 組，每組計 3 隻），"
                             "正常應為 13 或 14，請核對。"
                         )
                     return hand, note
@@ -541,27 +551,37 @@ button[data-baseweb="tab"][aria-selected="true"]{color:var(--gold);}
 [class*="st-key-tilebtn_"] button:hover::after{content:"✎";position:absolute;top:-6px;right:-5px;
   background:var(--gold);color:#1a1405;border-radius:50%;width:18px;height:18px;
   font-size:11px;line-height:18px;text-align:center;font-weight:700;}
-/* hand row: 14 tiles always one line */
+/* hand row: 14 tiles always one line; 3:4 boxes capped at 64px wide */
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) {
   flex-wrap:nowrap !important;
+  justify-content:flex-start !important;
   gap:4px !important;
   align-items:flex-end;
   overflow:visible;
 }
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [class*="st-key-tilebtn_"] {
-  flex:1 1 0 !important;
+  flex:0 1 64px !important;
+  width:64px !important;
   min-width:0 !important;
+  max-width:64px !important;
 }
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stLayoutWrapper"] {
-  flex:1 1 0 !important;
+  flex:0 1 64px !important;
+  width:64px !important;
   min-width:0 !important;
+  max-width:64px !important;
 }
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stElementContainer"]:not([class*="st-key-tilebtn_"]) {
   flex:0 0 16px !important;
 }
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) [class*="st-key-tilebtn_"] button {
   min-width:0 !important;
+  min-height:0 !important;
   width:100% !important;
+  height:auto !important;
+  aspect-ratio:3 / 4 !important;
+  background-size:contain !important;
+  object-fit:contain;
 }
 [class*="st-key-hand_card"] [data-testid="stHorizontalBlock"]:has(> [class*="st-key-tilebtn_"]) > [data-testid="stLayoutWrapper"] [data-testid="stElementContainer"] {
   width:100% !important;
@@ -826,10 +846,11 @@ with st.container(key="input_card", border=True):
         )
         c1, c2 = st.columns(2)
         if c1.button("用呢手牌", type="primary", width="stretch"):
-            _meld_flat = [t for g in st.session_state.get("meld_tiles", []) for t in g]
+            _meld_groups = st.session_state.get("meld_tiles", [])
+            _meld_flat = [t for g in _meld_groups for t in g]
             tiles, err = parse_hand_codes(
                 hand_text, int(meld_count),
-                meld_total=len(_meld_flat) if _meld_flat else None,
+                meld_total=3 * len(_meld_groups) if _meld_groups else None,
                 meld_codes=_meld_flat or None,
             )
             if tiles is None:
