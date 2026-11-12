@@ -951,7 +951,7 @@ with st.container(key="input_card", border=True):
                 st.rerun()
         if c2.button("⌨️ 開啟選牌盤", width="stretch"):
             st.session_state["picker"] = {"mode": "add", "index": None}
-            st.rerun()
+            st.session_state["picker_open"] = True
 
         st.caption(
             "格式：數字＋花色（m 萬 · p 筒 · s 索 · z 字：1東 2南 3西 4北 5白 6發 7中）；"
@@ -1079,14 +1079,14 @@ with st.container(key="hand_card", border=True):
                                 help=f"{tile_label(tile)}（點擊修改）",
                             ):
                                 st.session_state["picker"] = {"mode": "replace", "index": real_idx}
-                                st.rerun()
+                                st.session_state["picker_open"] = True
                     else:
                         if st.button(
                             " ", key=f"tilebtn_{disp_idx}",
                             help=f"{tile_label(tile)}（點擊修改）",
                         ):
                             st.session_state["picker"] = {"mode": "replace", "index": real_idx}
-                            st.rerun()
+                            st.session_state["picker_open"] = True
 
         with right:
             if meld_tiles:
@@ -1102,7 +1102,7 @@ with st.container(key="hand_card", border=True):
                                     "mode": "replace", "target": "meld",
                                     "group": gi, "index": mi,
                                 }
-                                st.rerun()
+                                st.session_state["picker_open"] = True
             elif int(meld_count) == 0:
                 st.markdown(
                     '<div class="meld-box">門清 — 冇副露<br>食・碰・槓顯示喺呢度</div>',
@@ -1429,8 +1429,6 @@ def _apply_pick(tile: str) -> None:
         st.session_state["meld_count_pending"] = len(groups)
         st.session_state.pop("analysis", None)
         st.session_state["recognized_notice"] = False
-        st.session_state.pop("picker", None)
-        st.rerun()
         return
 
     tiles = list(st.session_state.get("hand_tiles", []))
@@ -1454,11 +1452,57 @@ def _apply_pick(tile: str) -> None:
     st.session_state["hand_drawn"] = None
     st.session_state.pop("analysis", None)
     st.session_state["recognized_notice"] = False
+
+
+def _build_picker_css() -> str:
+    """One-off picker tile CSS (34 images + badges), built once per session."""
+    badge_style = (
+        "position:absolute;top:2px;right:3px;font-size:9px;line-height:1;"
+        "padding:2px 3px;border-radius:4px;background:rgba(13,19,15,.55);"
+        "color:#f7f2df;font-weight:600;pointer-events:none;z-index:2;"
+    )
+    css: list[str] = [
+        '[class*="st-key-pick_"] button{'
+        "height:auto !important;aspect-ratio:3/4;min-height:0 !important;"
+        "width:100%;padding:0 !important;"
+        "background-size:contain;background-repeat:no-repeat;background-position:center;"
+        "background-color:var(--tile);border:1px solid var(--tile-edge);"
+        "border-radius:8px;position:relative;overflow:hidden;"
+        "}",
+        '[class*="st-key-pick_"] button p{display:none;}',
+        '.st-key-pick_m_red,.st-key-pick_p_red,.st-key-pick_s_red{'
+        "max-width:56px !important;margin-left:auto !important;margin-right:auto !important;}",
+    ]
+
+    def add(key: str, code: str) -> None:
+        # Picker buttons are ~56px wide; 64px source height is enough and
+        # cuts the CSS payload substantially versus the 96px hand assets.
+        uri = ti.tile_uri(code, 64)
+        if not uri:
+            return
+        css.append(f'.st-key-{key} button{{background-image:url("{uri}");}}')
+        css.append(f'.st-key-{key} button::after{{content:"{code}";{badge_style}}}')
+
+    for suit in "mps":
+        for n in range(1, 10):
+            add(f"pick_{suit}{n}", f"{n}{suit}")
+    for n in range(1, 8):
+        add(f"pick_z{n}", f"{n}z")
+    for suit in "mps":
+        add(f"pick_{suit}_red", f"5{suit}r")
+    return f"<style>{''.join(css)}</style>"
+
+
+if "picker_css_html" not in st.session_state:
+    st.session_state["picker_css_html"] = _build_picker_css()
+
+
+def _close_picker_dialog() -> None:
+    st.session_state["picker_open"] = False
     st.session_state.pop("picker", None)
-    st.rerun()
 
 
-@st.dialog("🀄 選牌盤")
+@st.dialog("🀄 選牌盤", on_dismiss=_close_picker_dialog)
 def tile_picker_dialog() -> None:
     info = st.session_state.get("picker") or {}
     mode = info.get("mode", "add")
@@ -1476,45 +1520,7 @@ def tile_picker_dialog() -> None:
     else:
         st.caption("揀一隻牌加入手牌")
 
-    # 牌掣用真牌圖（per-key CSS background-image），右上角加代碼 badge
-    badge_style = (
-        "position:absolute;top:2px;right:3px;font-size:9px;line-height:1;"
-        "padding:2px 3px;border-radius:4px;background:rgba(13,19,15,.55);"
-        "color:#f7f2df;font-weight:600;pointer-events:none;z-index:2;"
-    )
-    picker_css: list[str] = [
-        '[class*="st-key-pick_"] button{'
-        "height:auto !important;aspect-ratio:3/4;min-height:0 !important;"
-        "width:100%;padding:0 !important;"
-        "background-size:contain;background-repeat:no-repeat;background-position:center;"
-        "background-color:var(--tile);border:1px solid var(--tile-edge);"
-        "border-radius:8px;position:relative;overflow:hidden;"
-        "}",
-        '[class*="st-key-pick_"] button p{display:none;}',
-        '.st-key-pick_m_red,.st-key-pick_p_red,.st-key-pick_s_red{'
-        "max-width:56px !important;margin-left:auto !important;margin-right:auto !important;}",
-    ]
-
-    def _add_tile_css(key: str, code: str) -> None:
-        uri = ti.tile_uri(code, 96)
-        if not uri:
-            return
-        picker_css.append(f'.st-key-{key} button{{background-image:url("{uri}");}}')
-        picker_css.append(
-            f'.st-key-{key} button::after{{content:"{code}";{badge_style}}}'
-        )
-
-    for suit in "mps":
-        for n in range(1, 10):
-            _add_tile_css(f"pick_{suit}{n}", f"{n}{suit}")
-
-    for n in range(1, 8):
-        _add_tile_css(f"pick_z{n}", f"{n}z")
-
-    for suit in "mps":
-        _add_tile_css(f"pick_{suit}_red", f"5{suit}r")
-
-    st.markdown(f"<style>{''.join(picker_css)}</style>", unsafe_allow_html=True)
+    st.markdown(st.session_state["picker_css_html"], unsafe_allow_html=True)
 
     for suit, title in (("m", "萬子"), ("p", "筒子"), ("s", "索子")):
         st.markdown(f"**{title}**")
@@ -1550,8 +1556,10 @@ def tile_picker_dialog() -> None:
             st.session_state["meld_count_pending"] = len(groups)
             st.session_state.pop("analysis", None)
             st.session_state["recognized_notice"] = False
-            st.session_state.pop("picker", None)
-            st.rerun()
+            if not groups:
+                st.session_state["picker_open"] = False
+                st.session_state.pop("picker", None)
+                st.rerun()
         else:
             tiles = list(st.session_state.get("hand_tiles", []))
             if mode == "replace" and index is not None and 0 <= index < len(tiles):
@@ -1563,9 +1571,9 @@ def tile_picker_dialog() -> None:
             st.session_state["hand_drawn"] = None
             st.session_state.pop("analysis", None)
             st.session_state["recognized_notice"] = False
-            st.session_state.pop("picker", None)
-            st.rerun()
+            st.session_state["picker"] = {"mode": "add", "index": None}
     if c2.button("完成", type="primary", width="stretch"):
+        st.session_state["picker_open"] = False
         st.session_state.pop("picker", None)
         st.rerun()
 
@@ -1668,7 +1676,7 @@ def _yaku_dialog() -> None:
         st.rerun()
 
 
-if st.session_state.get("picker"):
+if st.session_state.get("picker_open"):
     tile_picker_dialog()
 
 if st.session_state.get("yaku_open"):
