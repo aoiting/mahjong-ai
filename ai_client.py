@@ -469,6 +469,69 @@ def _post_smart(
     raise AIError("呼叫失敗。")
 
 
+GATE_PROMPT = """呢張相片或者遊戲截圖入面，有冇麻雀牌（手牌或者副露都計）？
+只准回答 YES 或 NO，唔要解釋、標點或者任何其他字。"""
+
+
+def gate_check(
+    image: Image.Image,
+    api_key: str,
+    model: str,
+    fallback_models: list[str] | None = None,
+) -> tuple[bool | None, str]:
+    """守門：回傳 True=YES、False=NO、None=API 失敗（fail-open）。"""
+    img = image.convert("RGB")
+    if img.width > 1600:
+        ratio = 1600 / img.width
+        img = img.resize((1600, max(1, int(img.height * ratio))), Image.LANCZOS)
+
+    models = [model]
+    for alt in (fallback_models if fallback_models is not None else VISION_FALLBACK_MODELS):
+        if alt and alt not in models:
+            models.append(alt)
+
+    last_err = ""
+    for m in models:
+        try:
+            data = _post_smart(
+                "/chat/completions",
+                api_key,
+                {
+                    "model": m,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": GATE_PROMPT},
+                                {"type": "image_url", "image_url": {"url": _data_uri(img)}},
+                            ],
+                        }
+                    ],
+                    # Reasoning models need room before they emit YES/NO.
+                    "max_tokens": 400,
+                    "temperature": 0,
+                },
+                timeout=60,
+                budgets=(),
+                effort="minimal",
+            )
+        except AIError as exc:
+            last_err = str(exc)
+            continue
+
+        text = (_message_text(data) or "").strip().upper()
+        if text == "YES":
+            return True, "YES"
+        if text == "NO":
+            return False, "NO"
+        if text:
+            # Strict parse: a non-YES/NO answer is a NO; do not guess.
+            return False, f"unparseable: {text[:80]}"
+        last_err = _empty_reason(data)
+
+    return None, last_err or "守門模型沒有回應。"
+
+
 def recognize_tile(
     tile: Image.Image,
     api_key: str,

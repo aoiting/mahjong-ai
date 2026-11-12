@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import re
+import time
 from pathlib import Path
 
 import requests
@@ -190,7 +191,16 @@ def set_hand(
 
 
 # ── 辨識結果快取 —— 只快取「成功」嘅結果。─────────────────────
-_RECOGNIZE_CACHE: dict[str, tuple[str, str, str | None, list | None]] = {}
+_RECOGNIZE_CACHE: dict[str, tuple[str, str, str | None, list | None, str]] = {}
+
+
+def _gate_cache() -> dict[str, str]:
+    """守門結果喺 session_state 持久化；script rerun 唔會清走。"""
+    cache = st.session_state.get("_gate_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state["_gate_cache"] = cache
+    return cache
 
 
 def _oriented_preview(image_bytes: bytes) -> Image.Image:
@@ -209,8 +219,47 @@ def _recognize_now(
     per_tile: bool = True,
     local_first: bool = False,
     status: dict | None = None,
+    skip_gate: bool = False,
 ) -> tuple[str | None, str]:
     image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+
+    # ── 守門：EXIF 轉正後、裁剪／切格之前，用同一 vision model 問一次 YES/NO ──
+    image_hash = hashlib.md5(image_bytes).hexdigest()
+    gate = None
+    gate_elapsed = None
+    gate_detail = ""
+    gate_cache = _gate_cache()
+    if skip_gate:
+        gate = "override"
+    elif provider == "openrouter" and api_key:
+        gate = gate_cache.get(image_hash)
+        if gate is None:
+            t0 = time.monotonic()
+            gate_yes, gate_detail = ai.gate_check(image, api_key, vision_model)
+            gate_elapsed = round(time.monotonic() - t0, 2)
+            if gate_yes is None:
+                gate = "error"  # fail-open：唔好因為守門網絡問題擋死用家
+            else:
+                gate = "yes" if gate_yes else "no"
+                gate_cache[image_hash] = gate
+    else:
+        gate = "unavailable"
+
+    if status is not None:
+        status["gate"] = gate
+        if gate_elapsed is not None:
+            status["gate_elapsed"] = gate_elapsed
+        if gate_detail:
+            status["gate_detail"] = gate_detail
+
+    if gate == "no":
+        if status is not None:
+            status["gate_blocked"] = True
+        return None, (
+            "⚠️ 呢張圖唔似有麻雀牌，係咪上傳錯咗？"
+            "請換一張手牌相或者遊戲截圖再試。"
+        )
+
     image = tr.crop_hand_region(image, bottom_pct)
 
     if engine == "auto":
@@ -283,6 +332,7 @@ def cached_recognize(
     per_tile: bool = True,
     local_first: bool = False,
     status: dict | None = None,
+    skip_gate: bool = False,
 ) -> tuple[str | None, str]:
     """辨識結果快取 —— 失敗唔會入快取，上游恢復就可以即刻重試。"""
     sig = hashlib.md5(
@@ -296,23 +346,31 @@ def cached_recognize(
                 str(bottom_pct).encode(),
                 b"pertile" if per_tile else b"whole",
                 b"localfirst" if local_first else b"ai",
+                b"skipgate" if skip_gate else b"gate",
             ]
         )
     ).hexdigest()
 
     if not force and sig in _RECOGNIZE_CACHE:
-        hand, msg, drawn, melds = _RECOGNIZE_CACHE[sig]
+        hand, msg, drawn, melds, gate = _RECOGNIZE_CACHE[sig]
         if status is not None:
             status["drawn"] = drawn
             status["meld_tiles"] = melds or []
+            status["gate"] = gate
         return hand, msg
 
     hand, msg = _recognize_now(
         image_bytes, engine, provider, api_key, vision_model,
         bottom_pct, per_tile, local_first, status=status,
+        skip_gate=skip_gate,
     )
+    if hand and (status or {}).get("gate") == "error" and "守門" not in msg:
+        msg += "\nℹ️ 守門檢查失敗（網絡／API），今次照常辨識。"
     if hand:
-        _RECOGNIZE_CACHE[sig] = (hand, msg, (status or {}).get("drawn"), (status or {}).get("meld_tiles"))
+        _RECOGNIZE_CACHE[sig] = (
+            hand, msg, (status or {}).get("drawn"),
+            (status or {}).get("meld_tiles"), (status or {}).get("gate", "yes"),
+        )
     return hand, msg
 
 
@@ -824,6 +882,37 @@ with st.container(key="input_card", border=True):
 
         if uploaded_image is not None:
             source_bytes = uploaded_image.getvalue()
+            source_hash = hashlib.md5(source_bytes).hexdigest()
+            bottom_pct = int(st.session_state.get("upload_bottom_pct", 100))
+            blocked = st.session_state.get("gate_blocked")
+            if blocked and blocked.get("sig") != source_hash:
+                st.session_state.pop("gate_blocked", None)
+
+            if blocked and blocked.get("sig") == source_hash:
+                st.warning(blocked["msg"])
+                if st.button(
+                    "我肯定呢張係麻雀相，照樣辨識",
+                    key="gate_override",
+                    width="stretch",
+                ):
+                    rec_status: dict = {}
+                    with st.spinner("照樣辨識中..."):
+                        hand, msg = cached_recognize(
+                            source_bytes, engine, provider, api_key,
+                            vision_model, force=True, bottom_pct=bottom_pct,
+                            per_tile=per_tile, local_first=local_first,
+                            status=rec_status, skip_gate=True,
+                        )
+                    st.session_state["recognize_msg"] = msg
+                    if hand:
+                        st.session_state.pop("gate_blocked", None)
+                        set_hand(
+                            ti.expand_hand(hand), "圖片上傳（已覆寫守門）",
+                            recognized=True, drawn=rec_status.get("drawn"),
+                            meld_tiles=rec_status.get("meld_tiles") or [],
+                        )
+                        st.rerun()
+
             st.image(
                 _oriented_preview(source_bytes),
                 caption="已上傳的圖片",
@@ -832,6 +921,7 @@ with st.container(key="input_card", border=True):
             with st.expander("🔍 裁剪設定", expanded=False):
                 bottom_pct = st.slider(
                     "只分析畫面底部百分比", 15, 100, 100, 5,
+                    key="upload_bottom_pct",
                     help="完整遊戲截圖先需要裁剪；純手牌條通常保持 100。",
                 )
             c1, c2 = st.columns(2)
@@ -847,14 +937,24 @@ with st.container(key="input_card", border=True):
                         per_tile=per_tile, local_first=local_first,
                         status=rec_status,
                     )
-                st.session_state["recognize_msg"] = msg
                 if hand:
+                    st.session_state.pop("gate_blocked", None)
+                    st.session_state["recognize_msg"] = msg
                     set_hand(
                         ti.expand_hand(hand), "圖片上傳",
                         recognized=True, drawn=rec_status.get("drawn"),
                         meld_tiles=rec_status.get("meld_tiles") or [],
                     )
                     st.rerun()
+                elif rec_status.get("gate") == "no":
+                    st.session_state.pop("recognize_msg", None)
+                    st.session_state["gate_blocked"] = {
+                        "sig": source_hash,
+                        "msg": msg,
+                    }
+                    st.rerun()
+                else:
+                    st.session_state["recognize_msg"] = msg
 
     with tab_manual:
         hand_text = st.text_input(
