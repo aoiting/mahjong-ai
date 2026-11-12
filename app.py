@@ -219,7 +219,6 @@ def _recognize_now(
     per_tile: bool = True,
     local_first: bool = False,
     status: dict | None = None,
-    skip_gate: bool = False,
 ) -> tuple[str | None, str]:
     image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
 
@@ -229,9 +228,7 @@ def _recognize_now(
     gate_elapsed = None
     gate_detail = ""
     gate_cache = _gate_cache()
-    if skip_gate:
-        gate = "override"
-    elif provider == "openrouter" and api_key:
+    if provider == "openrouter" and api_key:
         gate = gate_cache.get(image_hash)
         if gate is None:
             t0 = time.monotonic()
@@ -332,7 +329,6 @@ def cached_recognize(
     per_tile: bool = True,
     local_first: bool = False,
     status: dict | None = None,
-    skip_gate: bool = False,
 ) -> tuple[str | None, str]:
     """辨識結果快取 —— 失敗唔會入快取，上游恢復就可以即刻重試。"""
     sig = hashlib.md5(
@@ -346,7 +342,6 @@ def cached_recognize(
                 str(bottom_pct).encode(),
                 b"pertile" if per_tile else b"whole",
                 b"localfirst" if local_first else b"ai",
-                b"skipgate" if skip_gate else b"gate",
             ]
         )
     ).hexdigest()
@@ -362,7 +357,6 @@ def cached_recognize(
     hand, msg = _recognize_now(
         image_bytes, engine, provider, api_key, vision_model,
         bottom_pct, per_tile, local_first, status=status,
-        skip_gate=skip_gate,
     )
     if hand and (status or {}).get("gate") == "error" and "守門" not in msg:
         msg += "\nℹ️ 守門檢查失敗（網絡／API），今次照常辨識。"
@@ -888,36 +882,14 @@ with st.container(key="input_card", border=True):
             if blocked and blocked.get("sig") != source_hash:
                 st.session_state.pop("gate_blocked", None)
 
-            if blocked and blocked.get("sig") == source_hash:
-                st.warning(blocked["msg"])
-                if st.button(
-                    "我肯定呢張係麻雀相，照樣辨識",
-                    key="gate_override",
-                    width="stretch",
-                ):
-                    rec_status: dict = {}
-                    with st.spinner("照樣辨識中..."):
-                        hand, msg = cached_recognize(
-                            source_bytes, engine, provider, api_key,
-                            vision_model, force=True, bottom_pct=bottom_pct,
-                            per_tile=per_tile, local_first=local_first,
-                            status=rec_status, skip_gate=True,
-                        )
-                    st.session_state["recognize_msg"] = msg
-                    if hand:
-                        st.session_state.pop("gate_blocked", None)
-                        set_hand(
-                            ti.expand_hand(hand), "圖片上傳（已覆寫守門）",
-                            recognized=True, drawn=rec_status.get("drawn"),
-                            meld_tiles=rec_status.get("meld_tiles") or [],
-                        )
-                        st.rerun()
-
+            blocked_now = bool(blocked and blocked.get("sig") == source_hash)
             st.image(
                 _oriented_preview(source_bytes),
                 caption="已上傳的圖片",
-                width="stretch",
+                width=120 if blocked_now else "stretch",
             )
+            if blocked_now:
+                st.error(blocked["msg"].replace("⚠️ ", ""))
             with st.expander("🔍 裁剪設定", expanded=False):
                 bottom_pct = st.slider(
                     "只分析畫面底部百分比", 15, 100, 100, 5,
