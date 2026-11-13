@@ -19,9 +19,31 @@ Scope: four-player East-wind games (東風局), the format the model was trained
 
 Just open the live app: https://riichi-lens.streamlit.app/
 
-1. Enter your own OpenRouter API key in the sidebar (needed for tile recognition and explanations; charged per use by OpenRouter — the app itself has no subscription).
-2. Take a photo of your hand with your phone's camera, then upload it.
-3. Read the recommended discard, the tile-logic table, and the explanation.
+Enter your own OpenRouter API key in the sidebar (needed for tile recognition and explanations; charged per use by OpenRouter — the app itself has no subscription). Then follow the steps below.
+
+## How to use the app
+
+First, **set the situation （局勢設定）** in the sidebar: your round wind （場風） and seat wind （自風）, and type the dora indicator （寶牌指示牌）, e.g. `3p`, `5s` or `東`. Then work through the app's three steps:
+
+### ① 入手牌 — Enter your hand
+
+- **Upload a photo （上傳圖片）** — take a photo of your tiles with your phone's camera app first, then upload it. The app first checks that the photo really shows mahjong tiles (any other photo is stopped with a warning), then recognises the tiles in about 18–21 seconds.
+- **Manual input （手入）** — tap tiles on the tile picker to build your hand instead.
+
+### ② 你的手牌 — Your hand
+
+Your hand is shown as tile images. Check it before analysing: if a tile was misread, tap it to correct it, and add any open melds （副露） if your hand is open. Under your hand, the app shows the analysis:
+
+- the expert model's **recommended discard**, with the model's confidence;
+- the **Top 5** candidate discards, so you can compare alternatives;
+- a tile-logic table （牌理分析） for every possible discard — shanten （向聽）, useful tiles （進張） and how many of each are left;
+- a riichi reference: in similar first-tenpai situations from the expert data, how often the experts declared riichi.
+
+### ③ AI 解說 — AI explanation
+
+Press the explanation button to get a short, friendly explanation in Cantonese (yaku names in Chinese). The explanation only explains the model's decision, using the local engine's numbers — it never makes a different decision. The same hand is cached, so asking again costs no extra API call.
+
+**Also in the app:** a yaku guide （役種一覽） — a searchable list of 37 yaku types in Chinese, filterable by han, handy for checking what your hand is aiming for.
 
 ## Or run it locally
 
