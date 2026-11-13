@@ -1,22 +1,22 @@
 # 日本麻雀 AI 牌局分析助手 — Python 依賴
 # 安裝：pip install -r requirements.txt
 
-streamlit>=1.61.1
-pillow>=10.0.0
+streamlit>=1.67.0
+pillow>=13.0.0
 
 # 呼叫 OpenRouter（雲端）／本機 Ollama 都用 requests
-requests>=2.31.0
+requests>=2.34.2
 
 # 確定性麻雀計算（向聽／進張／役種／點數）
-mahjong>=2.0.0
+mahjong>=2.1.0
 
 # 出牌預測模型（handonly_model.joblib）
-scikit-learn>=1.3
-joblib>=1.3
+scikit-learn>=1.9.1
+joblib>=1.6.0
 
 # 本機手牌辨識（模板比對）
-opencv-python-headless>=4.8.0
-numpy>=1.25.0
+opencv-python-headless>=5.0.0.93
+numpy>=2.5.4
 
 # 註：Ollama 本機視覺模型唔使裝 Python 套件，
 # 只需另外安裝 Ollama 並執行 `ollama pull qwen2.5vl:7b`。
